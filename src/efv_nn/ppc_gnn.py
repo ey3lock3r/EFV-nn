@@ -27,6 +27,10 @@ class PPCNodeLayer(nn.Module):
         if unbatched:
             x_stream = x_stream.unsqueeze(0)
 
+        original_dtype = x_stream.dtype
+        # Holistic move: PPC iterations MUST be float32 for convergence stability
+        x_stream = x_stream.float()
+
         B, T, D, _ = x_stream.shape
         iters_run = 0
         
@@ -34,7 +38,7 @@ class PPCNodeLayer(nn.Module):
         with torch.no_grad():
             x_states = x_stream.clone().detach()
             
-            # Rotation of previous states: z * exp(i*phi)
+            # Rotation buffers are typically float32, math should preserve it
             x_prev = x_states[:, :-1, :, :] # [B, T-1, D, 2]
             prev_r, prev_i = x_prev[..., 0], x_prev[..., 1]
             
@@ -42,21 +46,22 @@ class PPCNodeLayer(nn.Module):
             rot_i = prev_r * self.sin_p + prev_i * self.cos_p
             rot_prev = torch.stack([rot_r, rot_i], dim=-1)
             
-            x_target_frozen = torch.zeros_like(x_states)
+            x_target_frozen = torch.zeros_like(x_states, dtype=torch.float32)
             x_target_frozen[:, 1:, :, :] = rot_prev
             x_target_frozen[:, 0, :, :] = x_states[:, 0, :, :]
             
             current_lr = self.base_local_lr
             for _ in range(max(1, local_iters - 1)):
                 iters_run += 1
+                # moe now handles float32/float16 holistically
                 prediction, indices, scores, counts = self.moe(x_states.reshape(B*T, D, 2))
-                prediction = prediction.reshape(B, T, D, 2)
+                prediction = prediction.float().reshape(B, T, D, 2)
                 residual = x_target_frozen - prediction
 
                 if self.use_jacobian:
                     step = self.moe.transpose_forward(
                         residual.reshape(B*T, D, 2), indices, scores, counts
-                    ).reshape(B, T, D, 2)
+                    ).float().reshape(B, T, D, 2)
                 else:
                     step = residual
 
@@ -68,26 +73,27 @@ class PPCNodeLayer(nn.Module):
                     break
         
         # 2. DEQ Gradient Attachment
-        # Re-calculate target for grad pass
+        # Everything here stays in float32 for the analytical bridge
         x_prev_grad = x_stream[:, :-1, :, :]
         pg_r, pg_i = x_prev_grad[..., 0], x_prev_grad[..., 1]
         rg_r = pg_r * self.cos_p - pg_i * self.sin_p
         rg_i = pg_r * self.sin_p + pg_i * self.cos_p
         
-        x_target_grad = torch.zeros_like(x_stream)
+        x_target_grad = torch.zeros_like(x_stream, dtype=torch.float32)
         x_target_grad[:, 1:, :, 0] = rg_r
         x_target_grad[:, 1:, :, 1] = rg_i
         x_target_grad[:, 0, :, :] = x_stream[:, 0, :, :]
         
         prediction_grad, _, _, _ = self.moe(x_states.reshape(B*T, D, 2))
-        prediction_grad = prediction_grad.reshape(B, T, D, 2)
+        prediction_grad = prediction_grad.float().reshape(B, T, D, 2)
         
         # Bridge uses un-decayed base_local_lr
         out = x_states + self.base_local_lr * (x_target_grad - prediction_grad)
         
         if unbatched:
             out = out.squeeze(0)
-        return out, iters_run
+            
+        return out.to(original_dtype), iters_run
 
 
 class PPCGraphLLM(nn.Module):
