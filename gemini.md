@@ -28,7 +28,8 @@
         - **Checkpointing:** Removed `autocast` from `checkpoint()` wrapper (doesn't propagate in `reentrant=False`). Autocast now lives inside layers.
     - **MoE Routing:** Gate now uses `[real||imag]` concat instead of `x.abs()` to leverage phase info. `k_nodes` scales dynamically ($B_T / num\_experts$).
     - **Library/Notebook Sync:** Fixed `ShardedPPCGraphLLM` return signature mismatch (`(logits, avg_iters)`). Replaced all notebook inline code with `uv` GitHub install.
-    - **Kaggle Env:** Lowered `requires-python` to `>=3.10`. Bypass git-pip cache via `!uv pip install --system --force-reinstall`.
+    - **Kaggle Setup:** Python req lowered to `>=3.10`. Bypass git-pip cache via `!uv pip install --system --force-reinstall`. Consolidated all installs into **Cell 1** for single-pass resolution.
+    - **Versioning:** Removed imaginary high versions (sklearn 1.8) which caused `ImportError`. Reverted to stable 2024 versions in `pyproject.toml`.
 - **[2026-04-10] PPC Optimization:**
     - **Mistake:** FP16 experts w/ 1e-4 LR stagnated. Reverted to FP32 (pre-View Trick).
     - **Learning:** `autocast` activation overhead savings are critical.
