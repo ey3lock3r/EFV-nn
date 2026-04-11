@@ -6,31 +6,24 @@
 
 ## 2. Standards
 - **Coding:** Modular, DRY, PEP 8, Type Hints, Robust Error Handling.
-- **Design:** No hardware conflicts (T4 VRAM). Prioritize stable architecture over fragile hacks.
-- **Source of Truth:** `src/` is the canonical library. Notebook imports via `pip install git+https://github.com/ey3lock3r/EFV-nn.git`. Never duplicate model code inline.
-- **Workflow:** All architecture changes go to `src/` → commit + push → notebook re-installs on next run. `gemini.md` is committed too.
+- **Design:** No hardware conflicts (T4 VRAM). Prioritize stable architecture over hacks.
+- **Source of Truth:** `src/` is canonical. Notebook installs via `uv` from GitHub.
+- **Workflow:** Mod `src/` → Push → Notebook re-installs. No inline duplication.
 - **Testing:** `pytest` (AAA).
 
 ## 3. Directives
-- **Workspace Hygiene:** Immediate cleanup of temp files/scratch/logs. Update `task.md`.
+- **Workspace Hygiene:** Immediate cleanup of temp/scratch. Update `task.md`.
 - **Review:** Consult `gemini.md` & `task.md` before architecture shifts.
-- **High-Density Logs:** Proactively update **Diary** mid-flow using concise tech-shorthand. No fluff.
+- **High-Density Logs:** Update **Diary** mid-flow using tech-shorthand. No fluff.
 
 ---
 
 ## 4. Learnings & Mistakes Diary
-- **[2026-04-11] Kaggle Environment Constraints:**
-    - **Mistake:** Set `requires-python = ">=3.14"` in `pyproject.toml`. Kaggle uses ~3.10-3.12.
-    - **Fix:** Lowered to `>=3.10`.
-    - **Learning (UV Speed):** Switched to `uv` for ultra-fast, reliable dependency installs. **Protocol:** Ensure `uv` is installed early, then use `!uv pip install --system --force-reinstall git+...` to pull latest library updates.
-    - **Mistake:** Scaled 64 -> 32 experts due to false OOM from stripping `.half()`.
-    - **Fix:** Use "View Trick": `experts_weight_real = nn.Parameter(torch.view_as_real(init_complex).half())`. Saves 50% VRAM (6GB vs 12GB). Unpack JIT: `view_as_complex(weight.float())`.
-    - **Mistake (NaN):** Removing `GradScaler` at Step 30 caused FP16 overflow (`>65504`) -> `inf` -> `NaN` (Adam $m/\sqrt{v}$).
-    - **Solution:** `GradScaler` fails on FP16 params (`ValueError`). Use **Manual Static Scaling**: `(loss/256).backward()` + `clip_grad_norm(1/256)`. Adam's scale-invariance ensures identical updates. **Never** disable `autocast` or `clipping`.
-- **[2026-04-11] DEQ Bridge & Vanishing Gradients:**
-    - **Mistake:** DEQ bridge used decayed `current_lr` (≈0.04). Applied over 24 layers: `0.04^24 ≈ 10^{-28}`. Signal vanished; loss flatlined (11.96 → 11.90).
-    - **Fix:** Bridge must use un-decayed constant: `out = x_states + self.base_local_lr * (target - pred)`. 
-    - **Rule:** Separate inner-loop LR (dynamic) from gradient bridge LR (static).
+- **[2026-04-11] Holistic Architecture & Kaggle Stabilization:**
+    - **VRAM/FP16:** 64 experts fit T4 via View Trick (`view_as_real(...).half()`). Unpack JIT: `view_as_complex(w.float())`. Saves 6GB.
+    - **NaN/Scaling:** `GradScaler` incompatible w/ FP16 params. Solution: **Manual Static Scaling** (`loss/256`, `clip/256`). Adam scale-invariance ensures identical updates.
+    - **Vanishing Gradients:** DEQ bridge used decayed `current_lr` (≈0.04) over 24 layers ($10^{-28}$ signal). Fix: Bridge uses static `base_local_lr`.
+    - **Kaggle Setup:** Python req lowered to `>=3.10`. Bypass git-pip cache via `!uv pip install --system --force-reinstall`.
 - **[2026-04-10] PPC Optimization:**
     - **Mistake:** FP16 experts w/ 1e-4 LR stagnated. Reverted to FP32 (pre-View Trick).
     - **Learning:** `autocast` activation overhead savings are critical.
