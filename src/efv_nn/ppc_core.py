@@ -87,26 +87,24 @@ class ExpertChoiceMoEMatcher(nn.Module):
         """
         x: [B_T, D, 2] interleaved real
         """
-        # Ensure float32 for sensitive iterative accumulation
         original_dtype = x.dtype
         x = x.float()
         
         B_T, D, _ = x.shape
         k_nodes = self.k_nodes_default if self.k_nodes_default is not None else max(1, B_T // self.num_experts)
 
-        # Gate uses full complex signal [real || imag]
-        x_gate_input = x.reshape(B_T, D * 2)  # [B_T, 2D]
-        scores = torch.matmul(x_gate_input, self.gate_weights.float())  # [B_T, num_experts]
-        topk_scores, topk_indices = torch.topk(scores, k_nodes, dim=0)  # [k_nodes, num_experts]
+        # Gate weights forced to float32
+        x_gate_input = x.reshape(B_T, D * 2)  
+        scores = torch.matmul(x_gate_input, self.gate_weights.float()) 
+        topk_scores, topk_indices = torch.topk(scores, k_nodes, dim=0)
 
         output = torch.zeros_like(x)
         counts = torch.zeros(B_T, 1, 1, device=x.device, dtype=torch.float32)
 
         for i in range(self.num_experts):
             idx = topk_indices[:, i]
-            # Manual Complex Matmul: (x_r + i*x_i)(w_r + i*w_i) = (x_r*w_r - x_i*w_i) + i*(x_r*w_i + x_i*w_r)
-            x_subset = x[idx] # [k_nodes, D, 2]
-            w_expert = self.experts_weight_real[i].float() # [D, D, 2]
+            x_subset = x[idx] 
+            w_expert = self.experts_weight_real[i].float()
             
             x_r, x_i = x_subset[..., 0], x_subset[..., 1]
             w_r, w_i = w_expert[..., 0], w_expert[..., 1]
@@ -115,8 +113,10 @@ class ExpertChoiceMoEMatcher(nn.Module):
             y_i = torch.matmul(x_r, w_i) + torch.matmul(x_i, w_r)
             y_expert = torch.stack([y_r, y_i], dim=-1) # [k_nodes, D, 2]
 
-            output.index_add_(0, idx, (y_expert * topk_scores[:, i:i+1].unsqueeze(-1)))
-            counts.index_add_(0, idx, torch.ones(k_nodes, 1, 1, device=x.device))
+            # FORCE FLOAT32 for accumulation to avoid autocast downscaling
+            update = (y_expert.float() * topk_scores[:, i:i+1].float().unsqueeze(-1))
+            output.index_add_(0, idx, update)
+            counts.index_add_(0, idx, torch.ones(k_nodes, 1, 1, device=x.device, dtype=torch.float32))
 
         res = self.activation(output / counts.clamp(min=1))
         return res.to(original_dtype), topk_indices, topk_scores, counts
@@ -124,7 +124,6 @@ class ExpertChoiceMoEMatcher(nn.Module):
     def transpose_forward(self, residual, topk_indices, topk_scores, counts):
         """
         Jacobian-Hermitian pass using manual complex math.
-        Computes J^H r = Σ_i s_i * W_i^H * r[idx_i]
         """
         original_dtype = residual.dtype
         residual = residual.float()
@@ -134,20 +133,20 @@ class ExpertChoiceMoEMatcher(nn.Module):
 
         for i in range(self.num_experts):
             idx = topk_indices[:, i]
-            w_expert = self.experts_weight_real[i].float() # [D, D, 2]
-            y_subset = residual[idx] # [k_nodes, D, 2]
+            w_expert = self.experts_weight_real[i].float() 
+            y_subset = residual[idx] 
             
-            # W^H = [W_r^T, -W_i^T].
-            # (y_r + i*y_i)(w_r^T - i*w_i^T) = (y_r*w_r^T + y_i*w_i^T) + i*(y_i*w_r^T - y_r*w_i^T)
             y_r, y_i = y_subset[..., 0], y_subset[..., 1]
             w_r_t = w_expert[..., 0].transpose(-2, -1)
             w_i_t = w_expert[..., 1].transpose(-2, -1)
             
             grad_r = torch.matmul(y_r, w_r_t) + torch.matmul(y_i, w_i_t)
             grad_i = torch.matmul(y_i, w_r_t) - torch.matmul(y_r, w_i_t)
-            expert_grad = torch.stack([grad_r, grad_i], dim=-1) # [k_nodes, D, 2]
+            expert_grad = torch.stack([grad_r, grad_i], dim=-1) 
             
-            out.index_add_(0, idx, (expert_grad * topk_scores[:, i:i+1].to(device=residual.device, dtype=torch.float32).unsqueeze(-1)))
+            # FORCE FLOAT32 for accumulation
+            update = (expert_grad.float() * topk_scores[:, i:i+1].float().unsqueeze(-1))
+            out.index_add_(0, idx, update)
 
         res = out / counts.clamp(min=1)
         return res.to(original_dtype)
