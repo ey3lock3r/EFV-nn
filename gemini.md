@@ -19,19 +19,12 @@
 ---
 
 ## 4. Learnings & Mistakes Diary
-- **[2026-04-11] Holistic Architecture & Kaggle Strategy:**
-    - **Stability/NaN:** `GradScaler` fails on FP16 params. Replaced with **Manual Static Scaling** (`loss/256`, `clip/256`). Adam scale-invariance preserves updates. **ModReLU `safe_mag` must be ≥1e-8** (fixed from 1e-12) to prevent FP16 div-by-zero.
-    - **VRAM/FP16:** 64 expertos (3.2B) fit T4 via View Trick (`view_as_real(...).half()`). Unpack JIT: `view_as_complex(w.float())`. Saves 6GB.
-    - **Gradients:**
-        - **DEQ Bridge:** Fixed vanishing signal ($10^{-28}$) by using static `base_local_lr` (previous used decayed `current_lr`).
-        - **Jacobian:** `transpose_forward` now weights by `topk_scores` to match weighted forward pass.
-        - **Checkpointing:** Removed `autocast` from `checkpoint()` wrapper (doesn't propagate in `reentrant=False`). Autocast now lives inside layers.
-    - **MoE Routing:** Gate now uses `[real||imag]` concat instead of `x.abs()` to leverage phase info. `k_nodes` scales dynamically ($B_T / num\_experts$).
-    - **Library/Notebook Sync:** Fixed `ShardedPPCGraphLLM` return signature mismatch (`(logits, avg_iters)`). Replaced all notebook inline code with `uv` GitHub install.
-    - **Kaggle Setup (Minimalist):** Replaced "Forced Reinstall" with **Minimalist Injection**. Protocol: Trust pre-installed `torch`, `numpy`, and `pandas` to maintain binary compatibility. ONLY force-reinstall your custom research library (`efv-nn`).
-    - **Binary Compatibility:** Solved `ValueError: numpy.dtype size changed` by removing all hard version pins from `pyproject.toml`, allowing `uv` to satisfy dependencies using the existing system stack.
-    - **CUDA/BitsAndBytes:** Solved `libnvJitLink.so.13` and `libcudart.so.11.0` errors on Kaggle via **Dynamic CUDA Discovery**. Added logic to Cell 1 to `find` the lib path and inject into `LD_LIBRARY_PATH` before import. Upgraded to `bitsandbytes>=0.45.0`.
-    - **Numpy 2.0 Conflict:** Solved `AttributeError: _blas_supports_fpe` by pinning `numpy<2.0.0`. Numpy 2.0 is currently incompatible with most pre-installed scientific packages (Scipy, Sklearn) in the Kaggle image.
+- **[2026-04-11] Architecture & Kaggle Strategy (Stability Priority):**
+    - **Calculus/NaN:** Jacobian weighted by `topk_scores`. Gate uses `[real||imag]` concat. Bridge uses static `base_local_lr`. ModReLU `safe_mag` ≥ 1e-8. Manual static scaling (`loss/256`) preserves FP16.
+    - **Installer Loop Fix (Decoupled Setup):** Removed `bitsandbytes` from core `pyproject.toml` dependencies. This prevents `uv` from triggering a recursive re-install (and re-breaking CUDA links) during the GitHub library installation. BNB is now a manual prerequisite in Cell 1.
+    - **Stability Fix (libnvJitLink):** Minimalist injection is too fragile on Kaggle. **Nuclear Option required**: Must `pip uninstall nvidia-*-cu12` and pin `bitsandbytes==0.42.0` to force fallback to system CUDA. 
+    - **Dynamic Discovery**: Quiet `LD_LIBRARY_PATH` injection in Cell 1 is mandatory to help `bitsandbytes` find `libcudart.so`.
+    - **Binary Compatibility:** Solved `ValueError: numpy.dtype size changed` by removing version pins (except BNB) and pinning `numpy<2.0.0`.
 - **[2026-04-10] PPC Optimization:**
     - **Mistake:** FP16 experts w/ 1e-4 LR stagnated. Reverted to FP32 (pre-View Trick).
     - **Learning:** `autocast` activation overhead savings are critical.
