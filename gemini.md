@@ -22,7 +22,7 @@
 - **[2026-04-11] Kaggle Environment Constraints:**
     - **Mistake:** Set `requires-python = ">=3.14"` in `pyproject.toml`. Kaggle uses ~3.10-3.12.
     - **Fix:** Lowered to `>=3.10`.
-    - **Learning (Pip Cache):** Kaggle's `!pip install git+url` often fails to update from the same URL due to caching. **Protocol:** Always use `--force-reinstall --no-cache-dir` in notebook install cells to ensure latest GitHub code is used.
+    - **Learning (UV Speed):** Switched to `uv` for ultra-fast, reliable dependency installs. **Protocol:** Always use `!pip install -q uv && !uv pip install --system --force-reinstall git+...` in notebook setup.
     - **Mistake:** Scaled 64 -> 32 experts due to false OOM from stripping `.half()`.
     - **Fix:** Use "View Trick": `experts_weight_real = nn.Parameter(torch.view_as_real(init_complex).half())`. Saves 50% VRAM (6GB vs 12GB). Unpack JIT: `view_as_complex(weight.float())`.
     - **Mistake (NaN):** Removing `GradScaler` at Step 30 caused FP16 overflow (`>65504`) -> `inf` -> `NaN` (Adam $m/\sqrt{v}$).
