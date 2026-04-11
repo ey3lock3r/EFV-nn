@@ -28,8 +28,8 @@
         - **Checkpointing:** Removed `autocast` from `checkpoint()` wrapper (doesn't propagate in `reentrant=False`). Autocast now lives inside layers.
     - **MoE Routing:** Gate now uses `[real||imag]` concat instead of `x.abs()` to leverage phase info. `k_nodes` scales dynamically ($B_T / num\_experts$).
     - **Library/Notebook Sync:** Fixed `ShardedPPCGraphLLM` return signature mismatch (`(logits, avg_iters)`). Replaced all notebook inline code with `uv` GitHub install.
-    - **Kaggle Setup:** Python req lowered to `>=3.10`. Bypass git-pip cache via `!uv pip install --system --force-reinstall`. Consolidated all installs into **Cell 1** for single-pass resolution.
-    - **Versioning:** Removed imaginary high versions (sklearn 1.8) which caused `ImportError`. Reverted to stable 2024 versions in `pyproject.toml`.
+    - **Kaggle Setup (Minimalist):** Replaced "Forced Reinstall" with **Minimalist Injection**. Protocol: Trust pre-installed `torch`, `numpy`, and `pandas` to maintain binary compatibility. ONLY force-reinstall your custom research library (`efv-nn`).
+    - **Binary Compatibility:** Solved `ValueError: numpy.dtype size changed` by removing all hard version pins from `pyproject.toml`, allowing `uv` to satisfy dependencies using the existing system stack.
     - **CUDA/BitsAndBytes:** Solved `libnvJitLink.so.13` and `libcudart.so.11.0` errors on Kaggle via **Dynamic CUDA Discovery**. Added logic to Cell 1 to `find` the lib path and inject into `LD_LIBRARY_PATH` before import. Upgraded to `bitsandbytes>=0.45.0`.
     - **Numpy 2.0 Conflict:** Solved `AttributeError: _blas_supports_fpe` by pinning `numpy<2.0.0`. Numpy 2.0 is currently incompatible with most pre-installed scientific packages (Scipy, Sklearn) in the Kaggle image.
 - **[2026-04-10] PPC Optimization:**
