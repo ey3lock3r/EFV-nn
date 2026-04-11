@@ -84,6 +84,31 @@ class ShardedPPCGraphLLM(nn.Module):
         # Issue 1 Fix: return (logits, avg_iters) matching notebook training loop expectation
         return logits, total_iters / self.num_layers
 
+    @torch.no_grad()
+    def generate(self, input_ids: torch.Tensor, max_new_tokens: int = 50, local_iters: int = 8, temperature: float = 1.0):
+        """
+        Auto-regressive generation using the sharded architecture.
+        """
+        device = input_ids.device
+        for _ in range(max_new_tokens):
+            # 1. Get logits from the sharded forward pass
+            logits, _ = self.forward(input_ids, local_iters=local_iters)
+            
+            # 2. Focus on the last token's logits
+            next_token_logits = logits[:, -1, :] / max(1e-6, temperature)
+            
+            # 3. Greedy sampling (argmax)
+            next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+            
+            # 4. Append to input sequence
+            input_ids = torch.cat([input_ids, next_token.to(device)], dim=1)
+            
+            # 5. Stop if we hit the EOS token (shorthand for 128001 in Llama-3 vocab)
+            if next_token.item() == 128001:
+                break
+                
+        return input_ids
+
     @property
     def total_params(self):
         return sum(p.numel() for p in self.parameters())
