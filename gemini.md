@@ -30,7 +30,7 @@
     - **Library/Notebook Sync:** Fixed `ShardedPPCGraphLLM` return signature mismatch (`(logits, avg_iters)`). Replaced all notebook inline code with `uv` GitHub install.
     - **Kaggle Setup:** Python req lowered to `>=3.10`. Bypass git-pip cache via `!uv pip install --system --force-reinstall`. Consolidated all installs into **Cell 1** for single-pass resolution.
     - **Versioning:** Removed imaginary high versions (sklearn 1.8) which caused `ImportError`. Reverted to stable 2024 versions in `pyproject.toml`.
-    - **CUDA/BitsAndBytes:** Fixed `libnvJitLink.so.13` error on Kaggle by pinning `bitsandbytes==0.42.0` and explicitly uninstalling `nvidia-*-cu12` pip packages. This forces the library to use the system CUDA runtime.
+    - **CUDA/BitsAndBytes:** Solved `libnvJitLink.so.13` and `libcudart.so.11.0` errors on Kaggle via **Dynamic CUDA Discovery**. Added logic to Cell 1 to `find` the lib path and inject into `LD_LIBRARY_PATH` before import. Upgraded to `bitsandbytes>=0.45.0`.
 - **[2026-04-10] PPC Optimization:**
     - **Mistake:** FP16 experts w/ 1e-4 LR stagnated. Reverted to FP32 (pre-View Trick).
     - **Learning:** `autocast` activation overhead savings are critical.
