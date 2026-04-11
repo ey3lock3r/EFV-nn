@@ -7,7 +7,8 @@
 ## 2. Standards
 - **Coding:** Modular, DRY, PEP 8, Type Hints, Robust Error Handling.
 - **Design:** No hardware conflicts (T4 VRAM). Prioritize stable architecture over fragile hacks.
-- **Sync:** Strict `src/` ↔ `.ipynb` alignment.
+- **Source of Truth:** `src/` is the canonical library. Notebook imports via `pip install git+https://github.com/ey3lock3r/EFV-nn.git`. Never duplicate model code inline.
+- **Workflow:** All architecture changes go to `src/` → commit + push → notebook re-installs on next run. `gemini.md` is committed too.
 - **Testing:** `pytest` (AAA).
 
 ## 3. Directives
