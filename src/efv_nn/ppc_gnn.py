@@ -11,57 +11,78 @@ class PPCNodeLayer(nn.Module):
         self.lr_decay = lr_decay
         self.tolerance = tolerance
         self.use_jacobian = use_jacobian
-        self.register_buffer('phase_offset', torch.rand(hidden_dim) * 2 * math.pi)
+        
+        # Phase rotation parameters: store as cos/sin for manual rotation
+        phase = torch.rand(hidden_dim) * 2 * math.pi
+        self.register_buffer('cos_p', torch.cos(phase))
+        self.register_buffer('sin_p', torch.sin(phase))
+        
         self.moe = ExpertChoiceMoEMatcher(hidden_dim, num_experts)
         
-    def forward(self, x_stream, local_iterations=8):
+    def forward(self, x_stream, local_iters=8):
         """
-        x_stream: [B, T, hidden_dim] batched sequence.
+        x_stream: [B, T, hidden_dim, 2] interleaved real
         """
-        unbatched = x_stream.dim() == 2
+        unbatched = x_stream.dim() == 3
         if unbatched:
             x_stream = x_stream.unsqueeze(0)
 
-        B, T, D = x_stream.shape
+        B, T, D, _ = x_stream.shape
         iters_run = 0
         
         # 1. Local Convergence (Frozen fixed point search)
         with torch.no_grad():
             x_states = x_stream.clone().detach()
+            
+            # Rotation of previous states: z * exp(i*phi)
+            x_prev = x_states[:, :-1, :, :] # [B, T-1, D, 2]
+            prev_r, prev_i = x_prev[..., 0], x_prev[..., 1]
+            
+            rot_r = prev_r * self.cos_p - prev_i * self.sin_p
+            rot_i = prev_r * self.sin_p + prev_i * self.cos_p
+            rot_prev = torch.stack([rot_r, rot_i], dim=-1)
+            
             x_target_frozen = torch.zeros_like(x_states)
-            x_target_frozen[:, 1:, :] = x_states[:, :-1, :] * torch.exp(1j * self.phase_offset)
-            x_target_frozen[:, 0, :] = x_states[:, 0, :]
+            x_target_frozen[:, 1:, :, :] = rot_prev
+            x_target_frozen[:, 0, :, :] = x_states[:, 0, :, :]
             
             current_lr = self.base_local_lr
-            for _ in range(max(1, local_iterations - 1)):
+            for _ in range(max(1, local_iters - 1)):
                 iters_run += 1
-                prediction, indices, scores, counts = self.moe(x_states.reshape(B*T, D))
-                prediction = prediction.reshape(B, T, D)
+                prediction, indices, scores, counts = self.moe(x_states.reshape(B*T, D, 2))
+                prediction = prediction.reshape(B, T, D, 2)
                 residual = x_target_frozen - prediction
 
                 if self.use_jacobian:
                     step = self.moe.transpose_forward(
-                        residual.reshape(B*T, D), indices, scores, counts
-                    ).reshape(B, T, D)
+                        residual.reshape(B*T, D, 2), indices, scores, counts
+                    ).reshape(B, T, D, 2)
                 else:
                     step = residual
 
                 x_states = x_states + current_lr * step
-                current_lr = current_lr * self.lr_decay # Decay learning rate
+                current_lr = current_lr * self.lr_decay
                 
-                # Dynamic Early Stopping
-                if residual.abs().mean() < self.tolerance:
+                # Early Stopping
+                if torch.norm(residual, dim=-1).mean() < self.tolerance:
                     break
         
-        # 2. DEQ Gradient Attachment (1nd-step analytical bridge)
+        # 2. DEQ Gradient Attachment
+        # Re-calculate target for grad pass
+        x_prev_grad = x_stream[:, :-1, :, :]
+        pg_r, pg_i = x_prev_grad[..., 0], x_prev_grad[..., 1]
+        rg_r = pg_r * self.cos_p - pg_i * self.sin_p
+        rg_i = pg_r * self.sin_p + pg_i * self.cos_p
+        
         x_target_grad = torch.zeros_like(x_stream)
-        x_target_grad[:, 1:, :] = x_stream[:, :-1, :] * torch.exp(1j * self.phase_offset)
-        x_target_grad[:, 0, :] = x_stream[:, 0, :]
+        x_target_grad[:, 1:, :, 0] = rg_r
+        x_target_grad[:, 1:, :, 1] = rg_i
+        x_target_grad[:, 0, :, :] = x_stream[:, 0, :, :]
         
-        prediction_grad, _, _, _ = self.moe(x_states.reshape(B*T, D))
-        prediction_grad = prediction_grad.reshape(B, T, D)
+        prediction_grad, _, _, _ = self.moe(x_states.reshape(B*T, D, 2))
+        prediction_grad = prediction_grad.reshape(B, T, D, 2)
         
-        # Bridge uses the un-decayed base_local_lr to preserve gradient magnitude through all layers
+        # Bridge uses un-decayed base_local_lr
         out = x_states + self.base_local_lr * (x_target_grad - prediction_grad)
         
         if unbatched:
@@ -70,71 +91,47 @@ class PPCNodeLayer(nn.Module):
 
 
 class PPCGraphLLM(nn.Module):
-    """
-    Prospective Predictive Coding Graph Language Model.
-
-    Architecture:
-      - Complex-valued token embeddings (magnitude × e^{iφ})
-      - Stacked PPCNodeLayer blocks (locally convergent, no global backprop through states)
-      - Real + Imaginary concatenated decoder head (preserves phase information)
-
-    Inputs:  [B, T] int64 token IDs  (or [T] for unbatched)
-    Outputs: [B, T, vocab_size] real logits
-    """
     def __init__(self, vocab_size: int, hidden_dim: int, num_layers: int = 2,
                  num_experts: int = 4, local_lr: float = 0.5, lr_decay: float = 0.85, use_jacobian: bool = False):
         super().__init__()
         self.vocab_size = vocab_size
         self.hidden_dim = hidden_dim
 
-        # Issue 7 (Fix): PyTorch's nn.Embedding does not support complex autograd.
-        # We use a real-valued embedding with 2*hidden_dim and view it as complex.
+        # Real-valued embedding stores interleaved complex [V, D, 2]
         self.embedding = nn.Embedding(vocab_size, hidden_dim * 2)
         
-        # Initialize with ComplexKaimingInitializer values
         with torch.no_grad():
             from efv_nn.ppc_core import ComplexKaimingInitializer
-            # Initialize a complex weight [V, D]
-            complex_w = ComplexKaimingInitializer.initialize((vocab_size, hidden_dim))
-            # View as real [V, D, 2] and flatten to [V, 2D] for the embedding table
-            real_w = torch.view_as_real(complex_w).reshape(vocab_size, hidden_dim * 2)
-            self.embedding.weight.copy_(real_w)
+            # Correctly initialise the interleaved real pair
+            init_w = ComplexKaimingInitializer.initialize((vocab_size, hidden_dim))
+            self.embedding.weight.copy_(init_w.reshape(vocab_size, hidden_dim * 2))
 
         self.layers = nn.ModuleList([
             PPCNodeLayer(hidden_dim, num_experts=num_experts, local_lr=local_lr, lr_decay=lr_decay, use_jacobian=use_jacobian)
             for _ in range(num_layers)
         ])
 
-        # Issue 8: Using both real and imaginary parts in the decoder to preserve phase info
+        # LayerNorm takes flattened 2D vector for stability
         self.layer_norm = nn.LayerNorm(hidden_dim * 2)     
         self.output_head = nn.Linear(hidden_dim * 2, vocab_size, bias=True)
         nn.init.zeros_(self.output_head.bias)
 
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Map token IDs → complex embeddings [*, T, D]."""
-        # [*, T, 2*D]
-        out_real_flat = self.embedding(input_ids)
-        # Reshape to [*, T, D, 2] so we can use view_as_complex
-        new_shape = list(out_real_flat.shape[:-1]) + [self.hidden_dim, 2]
-        out_real_struct = out_real_flat.view(*new_shape)
-        # Convert to complex [*, T, D]
-        return torch.view_as_complex(out_real_struct)
+        """Map token IDs -> interleaved real [*, T, D, 2]."""
+        # [*, T, 2*D] -> [*, T, D, 2]
+        out_flat = self.embedding(input_ids)
+        new_shape = list(out_flat.shape[:-1]) + [self.hidden_dim, 2]
+        return out_flat.view(*new_shape)
 
-    def forward(self, input_ids: torch.Tensor, local_iterations: int = 2) -> torch.Tensor:
-        """
-        input_ids: [B, T] or [T]
-        returns:   [B, T, vocab_size] or [T, vocab_size] real logits
-        """
-        x = self.embed(input_ids)            # complex [B, T, D] or [T, D]
+    def forward(self, input_ids: torch.Tensor, local_iters: int = 8) -> torch.Tensor:
+        x = self.embed(input_ids)            # [B, T, D, 2]
 
         total_iters = 0
         for layer in self.layers:
-            x, iters = layer(x, local_iterations)
+            x, iters = layer(x, local_iters)
             total_iters += iters
 
-        # Issue 8: Preserve phase info by using both parts
-        # If unbatched [T, D], x.real is [T, D], cat is [T, 2D]
-        x_real_imag = torch.cat([x.real, x.imag], dim=-1)
-        
-        x_norm = self.layer_norm(x_real_imag) 
-        return self.output_head(x_norm)      # [B, T, vocab_size]
+        # Flatten [..., D, 2] to [..., 2D] for decoder
+        x_flat = x.flatten(-2)
+        x_norm = self.layer_norm(x_flat) 
+        return self.output_head(x_norm)
