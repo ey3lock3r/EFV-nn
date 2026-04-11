@@ -85,68 +85,82 @@ class ExpertChoiceMoEMatcher(nn.Module):
 
     def forward(self, x):
         """
-        x: [B_T, D, 2] interleaved real
+        [B_T, D, 2] interleaved real -> [B_T, D, 2]
+        Vectorized Expert Choice MoE
         """
         original_dtype = x.dtype
-        x = x.float()
-        
+        # Logic: Experts run in autocast-selected precision (f16), but accumulate in f32
         B_T, D, _ = x.shape
         k_nodes = self.k_nodes_default if self.k_nodes_default is not None else max(1, B_T // self.num_experts)
 
-        # Gate weights forced to float32
-        x_gate_input = x.reshape(B_T, D * 2)  
-        scores = torch.matmul(x_gate_input, self.gate_weights.float()) 
-        topk_scores, topk_indices = torch.topk(scores, k_nodes, dim=0)
+        # 1. Gating
+        x_gate_input = x.reshape(B_T, D * 2).to(dtype=self.gate_weights.dtype)
+        scores = torch.matmul(x_gate_input, self.gate_weights)  # [B_T, num_experts]
+        topk_scores, topk_indices = torch.topk(scores, k_nodes, dim=0)  # [k_node, num_experts]
 
-        output = torch.zeros_like(x)
-        counts = torch.zeros(B_T, 1, 1, device=x.device, dtype=torch.float32)
+        # 2. Gather All Tokens for BMM
+        # topk_indices: [k, E] -> flat: [E*k]
+        flat_indices = topk_indices.T.reshape(-1)
+        # gathered_x: [E*k, D, 2] -> [E, k, D, 2]
+        x_batched = x[flat_indices].view(self.num_experts, k_nodes, D, 2)
 
-        for i in range(self.num_experts):
-            idx = topk_indices[:, i]
-            x_subset = x[idx] 
-            w_expert = self.experts_weight_real[i].float()
-            
-            x_r, x_i = x_subset[..., 0], x_subset[..., 1]
-            w_r, w_i = w_expert[..., 0], w_expert[..., 1]
-            
-            y_r = torch.matmul(x_r, w_r) - torch.matmul(x_i, w_i)
-            y_i = torch.matmul(x_r, w_i) + torch.matmul(x_i, w_r)
-            y_expert = torch.stack([y_r, y_i], dim=-1) # [k_nodes, D, 2]
+        # 3. Vectorized Complex BMM: (xr + i*xi)(wr + i*wi)
+        xr, xi = x_batched[..., 0], x_batched[..., 1]
+        # experts_weight_real: [E, D, D, 2]
+        wr, wi = self.experts_weight_real[..., 0], self.experts_weight_real[..., 1]
+        
+        # Restore experts to f32 if they were half-stored, but allow autocast to handle matmul
+        wr, wi = wr.to(x_batched.dtype), wi.to(x_batched.dtype)
 
-            # FORCE FLOAT32 for accumulation to avoid autocast downscaling
-            update = (y_expert.float() * topk_scores[:, i:i+1].float().unsqueeze(-1))
-            output.index_add_(0, idx, update)
-            counts.index_add_(0, idx, torch.ones(k_nodes, 1, 1, device=x.device, dtype=torch.float32))
+        yr = torch.matmul(xr, wr) - torch.matmul(xi, wi)
+        yi = torch.matmul(xr, wi) + torch.matmul(xi, wr)
+        y_all = torch.stack([yr, yi], dim=-1) # [E, k, D, 2]
 
+        # 4. Score Weighting
+        # topk_scores: [k, E] -> weights: [E, k, 1, 1]
+        weights = topk_scores.T.reshape(self.num_experts, k_nodes, 1, 1).to(y_all.dtype)
+        y_weighted = (y_all * weights).reshape(self.num_experts * k_nodes, D, 2)
+
+        # 5. Precision-Balanced Accumulation
+        output = torch.zeros((B_T, D, 2), device=x.device, dtype=torch.float32)
+        counts = torch.zeros((B_T, 1, 1), device=x.device, dtype=torch.float32)
+        
+        # Final accumulation MUST be float32 for stable PPC
+        output.index_add_(0, flat_indices, y_weighted.float())
+        counts.index_add_(0, flat_indices, torch.ones(self.num_experts * k_nodes, 1, 1, device=x.device, dtype=torch.float32))
+
+        # Activation
         res = self.activation(output / counts.clamp(min=1))
         return res.to(original_dtype), topk_indices, topk_scores, counts
 
     def transpose_forward(self, residual, topk_indices, topk_scores, counts):
         """
-        Jacobian-Hermitian pass using manual complex math.
+        Jacobian-Hermitian pass: Sigma s_i * W_i^H * r[idx_i]
+        Fully Vectorized.
         """
         original_dtype = residual.dtype
-        residual = residual.float()
-        
         B_T, D, _ = residual.shape
-        out = torch.zeros_like(residual)
+        k_nodes = topk_indices.shape[0]
 
-        for i in range(self.num_experts):
-            idx = topk_indices[:, i]
-            w_expert = self.experts_weight_real[i].float() 
-            y_subset = residual[idx] 
-            
-            y_r, y_i = y_subset[..., 0], y_subset[..., 1]
-            w_r_t = w_expert[..., 0].transpose(-2, -1)
-            w_i_t = w_expert[..., 1].transpose(-2, -1)
-            
-            grad_r = torch.matmul(y_r, w_r_t) + torch.matmul(y_i, w_i_t)
-            grad_i = torch.matmul(y_i, w_r_t) - torch.matmul(y_r, w_i_t)
-            expert_grad = torch.stack([grad_r, grad_i], dim=-1) 
-            
-            # FORCE FLOAT32 for accumulation
-            update = (expert_grad.float() * topk_scores[:, i:i+1].float().unsqueeze(-1))
-            out.index_add_(0, idx, update)
+        flat_indices = topk_indices.T.reshape(-1)
+        res_batched = residual[flat_indices].view(self.num_experts, k_nodes, D, 2)
+
+        # W^H = [W_r^T, -W_i^T].
+        # (yr + i*yi)(wr^T - i*wi^T) = (yr*wr^T + yi*wi^T) + i*(yi*wr^T - yr*wi^T)
+        yr, yi = res_batched[..., 0], res_batched[..., 1]
+        wr_t = self.experts_weight_real[..., 0].transpose(-2, -1).to(residual.dtype)
+        wi_t = self.experts_weight_real[..., 1].transpose(-2, -1).to(residual.dtype)
+        
+        grad_r = torch.matmul(yr, wr_t) + torch.matmul(yi, wi_t)
+        grad_i = torch.matmul(yi, wr_t) - torch.matmul(yr, wi_t)
+        grad_all = torch.stack([grad_r, grad_i], dim=-1) # [E, k, D, 2]
+
+        # Weighting
+        weights = topk_scores.T.reshape(self.num_experts, k_nodes, 1, 1).to(grad_all.dtype)
+        grad_weighted = (grad_all * weights).reshape(self.num_experts * k_nodes, D, 2)
+
+        out = torch.zeros((B_T, D, 2), device=residual.device, dtype=torch.float32)
+        out.index_add_(0, flat_indices, grad_weighted.float())
 
         res = out / counts.clamp(min=1)
         return res.to(original_dtype)
