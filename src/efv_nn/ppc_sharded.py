@@ -57,7 +57,7 @@ class ShardedPPCGraphLLM(nn.Module):
         out_real_struct = out_real_flat.view(*new_shape)
         return torch.view_as_complex(out_real_struct)
 
-    def forward(self, input_ids: torch.Tensor, local_iterations: int = 8):
+    def forward(self, input_ids: torch.Tensor, local_iters: int = 8):
         # Move input to device0
         input_ids = input_ids.to(self.device0)
         x = self.embed(input_ids)
@@ -72,9 +72,9 @@ class ShardedPPCGraphLLM(nn.Module):
             # into the recompute pass with use_reentrant=False, causing dtype mismatches.
             # autocast is applied INSIDE PPCNodeLayer / ExpertChoiceMoEMatcher instead.
             if self.training:
-                x, iters = checkpoint(layer, x, local_iterations, use_reentrant=False)
+                x, iters = checkpoint(layer, x, local_iters, use_reentrant=False)
             else:
-                x, iters = layer(x, local_iterations)
+                x, iters = layer(x, local_iters)
             total_iters += iters
 
         # Final decoding on device1
