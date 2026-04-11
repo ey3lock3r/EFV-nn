@@ -14,8 +14,9 @@
 ## 3. Directives
 - **Workspace Hygiene:** Immediate temp/scratch cleanup. Update `task.md`.
 - **Review:** Consult `gemini.md` & `task.md` PRIOR to architecture shifts.
+- **Zero-Loss Logging:** Maintain high-density technical shorthand in the Learnings Diary (**Zero Information Loss**) to ensure 100% architectural memory.
 - **Holistic Strategy:** Fixes MUST sync math (C-math parity), logic (PPC convergence), & engine (`compile`/`autocast`).
-- **Iterative Precision (f32):** All non-linear/iterative loops (PPC) MUST enforce **f32** internally to block `autocast` erosion/mismatch.
+- **Iterative Precision (f32):** Non-linear/iterative loops (PPC) MUST enforce **f32** internally to block `autocast` erosion.
 
 ---
 
