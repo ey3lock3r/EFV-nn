@@ -62,11 +62,11 @@ class PPCNodeLayer(nn.Module):
                     step = self.moe.transpose_forward(
                         residual.reshape(B*T, D, 2), indices, scores, counts
                     ).float().reshape(B, T, D, 2)
+                    x_states.add_(step, alpha=current_lr)
                 else:
-                    step = residual
-
-                x_states = x_states + current_lr * step
-                current_lr = current_lr * self.lr_decay
+                    x_states.add_(residual, alpha=current_lr)
+                    
+                current_lr *= self.lr_decay
         
         # 2. DEQ Gradient Attachment
         # Everything here stays in float32 for the analytical bridge
