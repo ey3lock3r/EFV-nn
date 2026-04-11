@@ -9,7 +9,7 @@ dependencies = [
     "numpy",
     "scikit-learn",
     "torch",
-    "bitsandbytes",
+    "bitsandbytes==0.42.0",
 ]
 
 [dependency-groups]
