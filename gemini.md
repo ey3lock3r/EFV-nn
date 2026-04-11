@@ -12,6 +12,8 @@
 - **Testing:** `pytest` (AAA).
 
 ## 3. Directives
+- **Workspace Hygiene:** Immediate cleanup of temp/scratch. Update `task.md`.
+- **Review:** Consult `gemini.md` & `task.md` before architecture shifts.
 - **Learnings & Mistakes Diary:** Update **Diary** mid-flow using tech-shorthand. **Zero Information Loss.**
 - **Holistic Implementation:** Every fix must consider math (C-math parity), logic (PPC convergence), and engine-level constraints (`torch.compile`/`autocast`).
 - **Iterative Precision Standard:** Any non-linear or iterative loop (e.g., the 16-step PPC convergence) MUST enforce **float32** internally to prevent compounding floating-point errors from `autocast` across steps.
