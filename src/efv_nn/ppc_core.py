@@ -87,16 +87,20 @@ class ExpertChoiceMoEMatcher(nn.Module):
         """
         x: [B_T, D, 2] interleaved real
         """
+        # Ensure float32 for sensitive iterative accumulation
+        original_dtype = x.dtype
+        x = x.float()
+        
         B_T, D, _ = x.shape
         k_nodes = self.k_nodes_default if self.k_nodes_default is not None else max(1, B_T // self.num_experts)
 
         # Gate uses full complex signal [real || imag]
         x_gate_input = x.reshape(B_T, D * 2)  # [B_T, 2D]
-        scores = torch.matmul(x_gate_input, self.gate_weights)  # [B_T, num_experts]
+        scores = torch.matmul(x_gate_input, self.gate_weights.float())  # [B_T, num_experts]
         topk_scores, topk_indices = torch.topk(scores, k_nodes, dim=0)  # [k_nodes, num_experts]
 
         output = torch.zeros_like(x)
-        counts = torch.zeros(B_T, 1, 1, device=x.device)
+        counts = torch.zeros(B_T, 1, 1, device=x.device, dtype=torch.float32)
 
         for i in range(self.num_experts):
             idx = topk_indices[:, i]
@@ -111,16 +115,20 @@ class ExpertChoiceMoEMatcher(nn.Module):
             y_i = torch.matmul(x_r, w_i) + torch.matmul(x_i, w_r)
             y_expert = torch.stack([y_r, y_i], dim=-1) # [k_nodes, D, 2]
 
-            output.index_add_(0, idx, y_expert * topk_scores[:, i:i+1].unsqueeze(-1))
+            output.index_add_(0, idx, (y_expert * topk_scores[:, i:i+1].unsqueeze(-1)))
             counts.index_add_(0, idx, torch.ones(k_nodes, 1, 1, device=x.device))
 
-        return self.activation(output / counts.clamp(min=1)), topk_indices, topk_scores, counts
+        res = self.activation(output / counts.clamp(min=1))
+        return res.to(original_dtype), topk_indices, topk_scores, counts
 
     def transpose_forward(self, residual, topk_indices, topk_scores, counts):
         """
         Jacobian-Hermitian pass using manual complex math.
         Computes J^H r = Σ_i s_i * W_i^H * r[idx_i]
         """
+        original_dtype = residual.dtype
+        residual = residual.float()
+        
         B_T, D, _ = residual.shape
         out = torch.zeros_like(residual)
 
@@ -139,7 +147,8 @@ class ExpertChoiceMoEMatcher(nn.Module):
             grad_i = torch.matmul(y_i, w_r_t) - torch.matmul(y_r, w_i_t)
             expert_grad = torch.stack([grad_r, grad_i], dim=-1) # [k_nodes, D, 2]
             
-            out.index_add_(0, idx, expert_grad * topk_scores[:, i:i+1].unsqueeze(-1))
+            out.index_add_(0, idx, (expert_grad * topk_scores[:, i:i+1].to(device=residual.device, dtype=torch.float32).unsqueeze(-1)))
 
-        return out / counts.clamp(min=1)
+        res = out / counts.clamp(min=1)
+        return res.to(original_dtype)
 
