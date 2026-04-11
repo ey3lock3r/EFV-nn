@@ -21,7 +21,8 @@
 
 ## 4. Learnings & Mistakes Diary
 - **[2026-04-11] 3.2B + Inductor Optimization:**
-    - **Interleaved Real (C-math):** `compile` failed on `complex64`. Migrated to **Real-Pair** `(..., 2)`. Manual `(ac-bd)` matmul. Result: 100% fusion & zero chatter in 16-step PPC loop.
+    - **Vectorized MoE (Speed Fix):** Serial Python loop was the bottleneck (64-expert serial lag). Migrated to **Batch-BMM** `[E, K, D]`. Result: Final parallelization of experts, enabling full `reduce-overhead` fusion.
+    - **Precision Balancing (T4):** Enforced `f16` for BMM matmuls to engage **Tensor Cores** (8x speedup). Kept `f32` ONLY for `index_add_` (scatter stability).
     - **Calculus/NaN:** `GradScaler` incompatible with FP16 params. Switched to **Static Scaling** (`loss/256`). **ModReLU**: `safe_mag` ≥1e-8 for FP16 stability.
     - **Memory (View 2.0):** 64 experts fit T4 via Real-Pair `half` storage. VRAM-parity with complex-view but Inductor-optimized.
     - **Jacobian/Bridge:** `transpose_forward` weighted by `topk_scores`. DEQ Bridge used **Static `base_local_lr`** to solve vanishing signal ($10^{-28}$).
