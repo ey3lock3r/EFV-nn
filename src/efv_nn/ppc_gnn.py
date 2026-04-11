@@ -50,10 +50,10 @@ class PPCNodeLayer(nn.Module):
             x_target_frozen[:, 1:, :, :] = rot_prev
             x_target_frozen[:, 0, :, :] = x_states[:, 0, :, :]
             
+            # Fixed-length loop for peak fusion: 16 small fused steps > 5 synced steps
             current_lr = self.base_local_lr
-            for _ in range(max(1, local_iters - 1)):
+            for i in range(local_iters):
                 iters_run += 1
-                # moe now handles float32/float16 holistically
                 prediction, indices, scores, counts = self.moe(x_states.reshape(B*T, D, 2))
                 prediction = prediction.float().reshape(B, T, D, 2)
                 residual = x_target_frozen - prediction
@@ -67,10 +67,6 @@ class PPCNodeLayer(nn.Module):
 
                 x_states = x_states + current_lr * step
                 current_lr = current_lr * self.lr_decay
-                
-                # Early Stopping
-                if torch.norm(residual, dim=-1).mean() < self.tolerance:
-                    break
         
         # 2. DEQ Gradient Attachment
         # Everything here stays in float32 for the analytical bridge

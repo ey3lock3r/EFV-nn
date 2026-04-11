@@ -126,8 +126,13 @@ class ExpertChoiceMoEMatcher(nn.Module):
         counts = torch.zeros((B_T, 1, 1), device=x.device, dtype=torch.float32)
         
         # Final accumulation MUST be float32 for stable PPC
+        # Cache ones for speed: size is self.num_experts * k_nodes
+        num_updates = self.num_experts * k_nodes
+        if not hasattr(self, '_ones_buf') or self._ones_buf.shape[0] != num_updates or self._ones_buf.device != x.device:
+            self.register_buffer('_ones_buf', torch.ones(num_updates, 1, 1, device=x.device, dtype=torch.float32), persistent=False)
+            
         output.index_add_(0, flat_indices, y_weighted.float())
-        counts.index_add_(0, flat_indices, torch.ones(self.num_experts * k_nodes, 1, 1, device=x.device, dtype=torch.float32))
+        counts.index_add_(0, flat_indices, self._ones_buf)
 
         # Activation
         res = self.activation(output / counts.clamp(min=1))
