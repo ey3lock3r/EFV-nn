@@ -9,6 +9,7 @@ dependencies = [
     "numpy>=1.24.0",
     "scikit-learn>=1.3.0",
     "torch>=2.2.0",
+    "bitsandbytes==0.42.0",
 ]
 
 [dependency-groups]
