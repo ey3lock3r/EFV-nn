@@ -8,19 +8,22 @@
 - **Coding:** Modular, DRY, PEP 8, Type Hints, Robust Error Handling.
 - **Design:** No hardware conflicts (T4 VRAM). Prioritize stable architecture over hacks.
 - **Source of Truth:** `src/` is canonical. Notebook imports source from GitHub clone.
-- **Workflow:** Mod `src/` → Push → Notebook pulls. No inline duplication.
 - **Testing:** `pytest` (AAA).
-
-## 3. Directives
-- **Workspace Hygiene:** Immediate temp/scratch cleanup. Update `task.md`.
-- **Review:** Consult `gemini.md` & `task.md` PRIOR to architecture shifts.
-- **Zero-Loss Logging:** Log insights **mid-flow** (during changes) using high-density shorthand (**Zero Information Loss**) to ensure 100% architectural memory.
-- **Holistic Strategy:** Every fix MUST consider math parity, algorithm logic, and engine constraints (`compile`/`autocast`) holistically.
-- **Iterative Precision (f32):** Non-linear/iterative loops (PPC) MUST enforce **f32** internally to block `autocast` erosion.
+## 3. Protocol & Workflow
+- **Loop:** `src/` (canonical) → **Pre-Flight Review** → **Execution** → **Log & Hygiene** → **Push** → **Notebook Pull**.
+- **Pre-Flight:** Before any change, perform a **SINGLE** holistic check of math parity, logic, and engine constraints (`compile`/`autocast`).
+- **High-Density Logging:** Log insights mid-flow using shorthand to maintain **Zero Information Loss** (ensure 100% architectural memory).
+- **Hygiene:** Immediate cleanup of scratch/temp files. Maintain `task.md` as the living status.
+- **No Duplication:** Never duplicate library code inside notebooks. Pull from master.
 
 ---
 
 ## 4. Learnings & Mistakes Diary
+- **[2026-04-12] Advanced Cognitive Inference (Swarm):**
+    - **Swarm Search (System 2):** Implemented parallel "Ghost State" exploration (N=8). Winners selected by lowest Phasal Resonance Energy (E).
+    - **CUDA Graph Overwrite (CRITICAL):** Identified `RuntimeError` during generation where Inductor's static CUDA Graph buffers were recycled before token-loop completion. **Fix:** Mandatory `.clone()` as state tensors exit each Island block.
+    - **Signature Alignment:** Integrated `E (Energy)` return into all model methods (+forward/generate). Energy monitoring is now our primary "Internal Signal" for training stability.
+    - **Protocol V2:** Optimized thinking throughput by collapsing holistic checks into a single "Pre-Flight" pass and integrating Log/Hygiene into the core loop.
 - **[2026-04-11] 3.2B + Inductor Optimization:**
     - **Vectorized MoE (Speed Fix):** Serial Python loop was the bottleneck. Migrated to **Batch-BMM** `[E, K, D]`.
     - **Zero-Break Fusion:** Identified **Early-Stopping Break** as a 384-sync/step bottleneck. Migrated to **Static-Length Loops** for 100% Inductor fusion. Result: Fused 16-step GPU burst >> 5-step synced sync. [Duration Delta: TBD ms/step]
