@@ -15,6 +15,8 @@
 - **High-Density Logging:** Log insights mid-flow using shorthand to maintain **Zero Information Loss** (ensure 100% architectural memory).
 - **Hygiene:** Immediate cleanup of scratch/temp files. Maintain `task.md` as the living status.
 - **No Duplication:** Never duplicate library code inside notebooks. Pull from master.
+- **High-Density Pulse (HDP):** Standard telemetry for log sharing.
+    `St {step} | L: {loss} | E: {energy} | It: {iters} | D: {ms} | LR: {lr}`
 
 ---
 
