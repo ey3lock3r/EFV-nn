@@ -26,13 +26,15 @@ class ShardedPPCGraphLLM(nn.Module):
             init_w = ComplexKaimingInitializer.initialize((vocab_size, hidden_dim))
             self.embedding.weight.copy_(init_w.reshape(vocab_size, hidden_dim * 2))
 
-        # 2. Sharded Layer Blocks
+        # 2. Sharded Layer Blocks (Independently Compiled Islands)
         self.layers = nn.ModuleList()
         for i in range(num_layers):
             target_device = self.device0 if i < self.split_point else self.device1
-            self.layers.append(
-                PPCNodeLayer(hidden_dim, num_experts=num_experts, local_lr=local_lr, lr_decay=lr_decay, use_jacobian=use_jacobian).to(target_device)
-            )
+            layer = PPCNodeLayer(hidden_dim, num_experts=num_experts, local_lr=local_lr, lr_decay=lr_decay, use_jacobian=use_jacobian).to(target_device)
+            
+            # Island Optimization: Compile each layer individually to avoid Multi-Device Graph Breaks
+            compiled_layer = torch.compile(layer, mode="reduce-overhead")
+            self.layers.append(compiled_layer)
 
         # 3. Output Head (GPU 1)
         self.layer_norm = nn.LayerNorm(hidden_dim * 2).to(self.device1)
@@ -54,10 +56,9 @@ class ShardedPPCGraphLLM(nn.Module):
             if i == self.split_point:
                 x = x.to(self.device1)
 
-            if self.training:
-                x, iters = checkpoint(layer, x, local_iters, use_reentrant=False)
-            else:
-                x, iters = layer(x, local_iters)
+            # Checkpointing is removed: We have 14GB free VRAM per T4. 
+            # Ditching it saves the 16-iteration re-computation overhead in backward pass.
+            x, iters = layer(x, local_iters)
             total_iters += iters
 
         # Final decoding on device1
