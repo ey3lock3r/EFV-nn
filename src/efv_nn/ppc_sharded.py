@@ -59,6 +59,7 @@ class ShardedPPCGraphLLM(nn.Module):
 
             # Checkpointing is removed: We have 14GB free VRAM per T4. 
             x, iters, res_norm = layer(x, local_iters)
+            x = x.clone() # Isolation: Prevent CUDA Graph buffer overwrite in loops
             total_iters += iters
             res_energies.append(res_norm)
 
@@ -96,6 +97,7 @@ class ShardedPPCGraphLLM(nn.Module):
                 curr_x = curr_x.to(self.device1)
             
             curr_x, iters, res_norm = layer(curr_x, local_iters)
+            curr_x = curr_x.clone() # Isolation: Prevent CUDA Graph buffer overwrite in loops
             # res_norm is usually scalar mean, but for swarm we need per-sample
             # In swarm mode, we'll re-calculate norm locally for selection
             total_iters += iters
