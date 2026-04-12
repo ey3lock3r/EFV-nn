@@ -23,7 +23,8 @@
     - **Swarm Search (System 2):** Implemented parallel "Ghost State" exploration (N=8). Winners selected by lowest Phasal Resonance Energy (E). Fixed `IndexError` by aligning dimensional reduction in selection logic.
     - **CUDA Graph Overwrite (CRITICAL):** Identified `RuntimeError` during generation where Inductor's static CUDA Graph buffers were recycled before token-loop completion. **Fix:** Mandatory `.clone()` as state tensors exit each Island block.
     - **Signature Alignment:** Integrated `E (Energy)` return into all model methods (+forward/generate). Energy monitoring is now our primary "Internal Signal" for training stability.
-    - **Protocol V2:** Optimized thinking throughput by collapsing holistic checks into a single "Pre-Flight" pass and integrating Log/Hygiene into the core loop.
+    - **Global Model Pattern:** Transitioned notebook to decoupled architecture. 3.2B instantiation and checkpoint loading moved to a dedicated 'Setup' cell. Enables instant Train <-> Verify switching and live hot-patching without reloading VRAM.
+    - **Inductor Optimization (Island only):** Removed redundant global `torch.compile(model)` in favor of class-internal per-layer compilation. Prevents cross-device graph breaks and reduces cold-start latency.
 - **[2026-04-11] 3.2B + Inductor Optimization:**
     - **Vectorized MoE (Speed Fix):** Serial Python loop was the bottleneck. Migrated to **Batch-BMM** `[E, K, D]`.
     - **Zero-Break Fusion:** Identified **Early-Stopping Break** as a 384-sync/step bottleneck. Migrated to **Static-Length Loops** for 100% Inductor fusion. Result: Fused 16-step GPU burst >> 5-step synced sync. [Duration Delta: TBD ms/step]
