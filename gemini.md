@@ -20,7 +20,7 @@
 
 ## 4. Learnings & Mistakes Diary
 - **[2026-04-12] Advanced Cognitive Inference (Swarm):**
-    - **Swarm Search (System 2):** Implemented parallel "Ghost State" exploration (N=8). Winners selected by lowest Phasal Resonance Energy (E).
+    - **Swarm Search (System 2):** Implemented parallel "Ghost State" exploration (N=8). Winners selected by lowest Phasal Resonance Energy (E). Fixed `IndexError` by aligning dimensional reduction in selection logic.
     - **CUDA Graph Overwrite (CRITICAL):** Identified `RuntimeError` during generation where Inductor's static CUDA Graph buffers were recycled before token-loop completion. **Fix:** Mandatory `.clone()` as state tensors exit each Island block.
     - **Signature Alignment:** Integrated `E (Energy)` return into all model methods (+forward/generate). Energy monitoring is now our primary "Internal Signal" for training stability.
     - **Protocol V2:** Optimized thinking throughput by collapsing holistic checks into a single "Pre-Flight" pass and integrating Log/Hygiene into the core loop.

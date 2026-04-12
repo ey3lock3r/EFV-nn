@@ -108,7 +108,8 @@ class ShardedPPCGraphLLM(nn.Module):
         
         # Calculate Energy per Ghost [B, S]
         # We look at the final phasal stability of each ghost
-        final_energy = torch.norm(curr_x[..., 1], dim=(-2, -1)).mean(dim=-1) # [B, S]
+        # curr_x[..., 1] is [B, S, T, D]
+        final_energy = torch.norm(curr_x[..., 1], dim=(-2, -1)) # Result: [B, S]
         
         winner_indices = torch.argmin(final_energy, dim=1) # [B]
         
