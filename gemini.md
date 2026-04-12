@@ -28,6 +28,7 @@
     - **NaN Stability:** Added `torch.clamp([-10, 10])` to the PPC update logic. Fixes explosive gradient updates common in early training with Jacobian-enabled MoE.
     - **Performance Fix (Sync Bottleneck):** Identified per-layer `.item()` calls as a 4x slowdown. Moving the energy sync point to the final output head restored full GPU pipelining.
     - **Cross-Device Energy Fix:** Added explicit `.to(device1)` for energy aggregation in sharded model to resolve `RuntimeError` on dual-GPU setup.
+    - **Hot-Patch vs. Compile Conflict:** Discovered that re-binding methods on a `CompiledModule` instance forces an eager fallback. Deprecated the `sync_source` hot-patch helper; reloads are now strictly pre-instantiation (Cell 4) to preserve Efficiency Purity.
 - **[2026-04-11] 3.2B + Inductor Optimization:**
     - **Vectorized MoE (Speed Fix):** Serial Python loop was the bottleneck. Migrated to **Batch-BMM** `[E, K, D]`.
     - **Zero-Break Fusion:** Identified **Early-Stopping Break** as a 384-sync/step bottleneck. Migrated to **Static-Length Loops** for 100% Inductor fusion. Result: Fused 16-step GPU burst >> 5-step synced sync. [Duration Delta: TBD ms/step]
