@@ -21,6 +21,11 @@
 ---
 
 ## 4. Learnings & Mistakes Diary
+- **[2026-04-12] Spectral Evolution (Dual-Track Launch):**
+    - **Spectral Guardian (Pillar 2):** Added `spectral_guardian_penalty()` to `ppc_gnn.py`. 1D Laplacian smoothing across 24-layer energy vector. λ=0.01. Toggled via `ENABLE_SPECTRAL_GUARDIAN` in Cell 4. Zero CPU syncs, zero graph breaks.
+    - **Vectorized Energy Map:** `ShardedPPCGraphLLM.forward()` now returns `(logits, iters, avg_energy, layer_energies)`. All callers updated.
+    - **Spectral Lab (Pillars 1 & 3):** Isolated sandbox in `research/`. `SpectralShardedPPCGraphLLM` inherits 3.2B base. `SpectralExpertGate` (FFT routing) and `EigenResonanceSolver` (rank-8 projection) added. New metric: `E_std` (layer energy variance).
+    - **Hot-Patch vs. Compile Conflict:** Discovered that re-binding methods on a `CompiledModule` instance forces an eager fallback. Deprecated the `sync_source` hot-patch helper; reloads are now strictly pre-instantiation (Cell 4) to preserve Efficiency Purity.
 - **[2026-04-12] Advanced Cognitive Inference (Swarm):**
     - **Swarm Search (System 2):** Implemented parallel "Ghost State" exploration (N=8). Winners selected by lowest Phasal Resonance Energy (E). Fixed `IndexError` by aligning dimensional reduction in selection logic.
     - **CUDA Graph Overwrite (CRITICAL):** Identified `RuntimeError` during generation where Inductor's static CUDA Graph buffers were recycled before token-loop completion. **Fix:** Mandatory `.clone()` as state tensors exit each Island block.
