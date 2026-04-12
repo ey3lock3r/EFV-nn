@@ -62,9 +62,10 @@ class PPCNodeLayer(nn.Module):
                     step = self.moe.transpose_forward(
                         residual.reshape(B*T, D, 2), indices, scores, counts
                     ).float().reshape(B, T, D, 2)
-                    x_states.add_(step, alpha=current_lr)
+                    # Safety Clamp: Prevent explosive updates in early random-weight phase
+                    x_states.add_(torch.clamp(step, -10.0, 10.0), alpha=current_lr)
                 else:
-                    x_states.add_(residual, alpha=current_lr)
+                    x_states.add_(torch.clamp(residual, -10.0, 10.0), alpha=current_lr)
                     
                 current_lr *= self.lr_decay
         
