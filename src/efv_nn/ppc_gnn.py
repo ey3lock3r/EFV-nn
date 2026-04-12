@@ -89,7 +89,7 @@ class PPCNodeLayer(nn.Module):
         
         # Calculate final resonance energy (L2 norm of error) for swarm/diagnostics
         with torch.no_grad():
-            res_norm = torch.norm(x_target_frozen - prediction_grad, dim=-1).mean().item()
+            res_norm = torch.norm(x_target_frozen - prediction_grad, dim=-1).mean()
 
         if unbatched:
             out = out.squeeze(0)

@@ -63,7 +63,8 @@ class ShardedPPCGraphLLM(nn.Module):
             total_iters += iters
             res_energies.append(res_norm)
 
-        avg_energy = sum(res_energies) / len(res_energies)
+        # One single sync point at the end of the entire graph
+        avg_energy = (sum(res_energies) / len(res_energies)).item()
 
         # Final decoding on device1
         x_flat = x.flatten(-2) # [..., 2D]
