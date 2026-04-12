@@ -38,7 +38,7 @@ class PPCNodeLayer(nn.Module):
         
         self.moe = ExpertChoiceMoEMatcher(hidden_dim, num_experts)
         
-    def forward(self, x_stream, local_iters=8):
+    def forward(self, x_stream, local_iters=8, gate_bias=None):
         """
         x_stream: [B, T, hidden_dim, 2] interleaved real
         """
@@ -73,7 +73,7 @@ class PPCNodeLayer(nn.Module):
             current_lr = self.base_local_lr
             for i in range(local_iters):
                 iters_run += 1
-                prediction, indices, scores, counts = self.moe(x_states.reshape(B*T, D, 2))
+                prediction, indices, scores, counts = self.moe(x_states.reshape(B*T, D, 2), gate_bias=gate_bias)
                 prediction = prediction.float().reshape(B, T, D, 2)
                 residual = x_target_frozen - prediction
 
@@ -153,11 +153,17 @@ class PPCGraphLLM(nn.Module):
         x = self.embed(input_ids)            # [B, T, D, 2]
 
         total_iters = 0
+        res_energies = []
         for layer in self.layers:
-            x, iters = layer(x, local_iters)
+            x, iters, res_norm = layer(x, local_iters)
             total_iters += iters
+            res_energies.append(res_norm)
+
+        layer_energies = torch.stack(res_energies)
+        avg_energy = layer_energies.mean()
 
         # Flatten [..., D, 2] to [..., 2D] for decoder
         x_flat = x.flatten(-2)
-        x_norm = self.layer_norm(x_flat) 
-        return self.output_head(x_norm)
+        x_norm = self.layer_norm(x_flat)
+        logits = self.output_head(x_norm)
+        return logits, total_iters / len(self.layers), avg_energy, layer_energies

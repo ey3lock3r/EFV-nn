@@ -130,18 +130,20 @@ class EigenResonanceSolver(nn.Module):
         """
         B, T, D, _ = x.shape
         x_real = x[..., 0]  # [B, T, D]
+        x_imag = x[..., 1]  # [B, T, D]
 
-        # Low-rank spectral projection: project onto phasal basis
-        # coeff: [B, T, K]
-        coeff = torch.einsum("btd,dk->btk", x_real, self.phasal_basis)
-        # Weight by learned "eigenvalues" (energy decay)
-        weighted = coeff * torch.softmax(self.phasal_energy, dim=0)
-        # Reconstruct projected state [B, T, D]
-        x_proj = torch.einsum("btk,dk->btd", weighted, self.phasal_basis)
+        # Low-rank spectral projection: project both components onto phasal basis
+        energy_weights = torch.softmax(self.phasal_energy, dim=0)
 
-        # Blend original imaginary (phase angle) with projected real (magnitude)
-        x_out = torch.stack([x_proj, x[..., 1]], dim=-1)
-        return x_out
+        # Real projection
+        coeff_r = torch.einsum("btd,dk->btk", x_real, self.phasal_basis)
+        x_proj_r = torch.einsum("btk,dk->btd", coeff_r * energy_weights, self.phasal_basis)
+
+        # Imaginary projection
+        coeff_i = torch.einsum("btd,dk->btk", x_imag, self.phasal_basis)
+        x_proj_i = torch.einsum("btk,dk->btd", coeff_i * energy_weights, self.phasal_basis)
+
+        return torch.stack([x_proj_r, x_proj_i], dim=-1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -192,7 +194,7 @@ class SpectralShardedPPCGraphLLM(ShardedPPCGraphLLM):
         """
         Spectral-augmented forward pass.
 
-        Pillar 1 is applied as a gate bias at the shard boundaries.
+        Pillar 1 is applied as a gate bias at the start of each shard.
         Pillar 3 replaces the iterative PPC loop when enabled.
         """
         input_ids = input_ids.to(self.device0)
@@ -201,16 +203,31 @@ class SpectralShardedPPCGraphLLM(ShardedPPCGraphLLM):
         total_iters = 0
         res_energies = []
 
+        # Pillar 1: Compute spectral gate bias per shard
+        gate_bias_0 = None
+        gate_bias_1 = None
+        if self.use_spectral_gate:
+            B, T, D, _ = x.shape
+            gate_bias_0 = self.spectral_gate_0(x).reshape(B * T, -1)        # [B*T, E]
+            # We'll compute gate_bias_1 after the device transfer
+
         for i, layer in enumerate(self.layers):
             if i == self.split_point:
                 x = x.to(self.device1)
+                # Compute Pillar 1 bias for shard 1 after transfer
+                if self.use_spectral_gate:
+                    B, T, D, _ = x.shape
+                    gate_bias_1 = self.spectral_gate_1(x).reshape(B * T, -1)
+
+            # Select the correct gate bias for this shard
+            current_gate_bias = gate_bias_0 if i < self.split_point else gate_bias_1
 
             # Pillar 3: Eigen-Resonance pre-conditioning (before iterative loop)
             if self.use_eigen_resonance:
                 solver = self.eigen_solver_0 if i < self.split_point else self.eigen_solver_1
                 x = x + solver(x)  # Residual spectral projection
 
-            x, iters, res_norm = layer(x, local_iters)
+            x, iters, res_norm = layer(x, local_iters, gate_bias=current_gate_bias)
             x = x.clone()
             total_iters += iters
             res_energies.append(res_norm)

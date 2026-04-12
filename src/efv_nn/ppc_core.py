@@ -83,10 +83,14 @@ class ExpertChoiceMoEMatcher(nn.Module):
 
         self.activation = ModReLU(hidden_dim)
 
-    def forward(self, x):
+    def forward(self, x, gate_bias=None):
         """
         [B_T, D, 2] interleaved real -> [B_T, D, 2]
         Vectorized Expert Choice MoE
+
+        Args:
+            x: [B_T, D, 2] input tensor.
+            gate_bias: Optional [B_T, num_experts] spectral routing bias.
         """
         original_dtype = x.dtype
         # Logic: Experts run in autocast-selected precision (f16), but accumulate in f32
@@ -96,6 +100,11 @@ class ExpertChoiceMoEMatcher(nn.Module):
         # 1. Gating
         x_gate_input = x.reshape(B_T, D * 2).to(dtype=self.gate_weights.dtype)
         scores = torch.matmul(x_gate_input, self.gate_weights)  # [B_T, num_experts]
+
+        # Pillar 1: Spectral Gate-Filtering injection point
+        if gate_bias is not None:
+            scores = scores + gate_bias.to(scores.dtype)
+
         topk_scores, topk_indices = torch.topk(scores, k_nodes, dim=0)  # [k_node, num_experts]
 
         # 2. Gather All Tokens for BMM
