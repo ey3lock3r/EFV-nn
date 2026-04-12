@@ -86,10 +86,14 @@ class PPCNodeLayer(nn.Module):
         # Bridge uses un-decayed base_local_lr
         out = x_states + self.base_local_lr * (x_target_grad - prediction_grad)
         
+        # Calculate final resonance energy (L2 norm of error) for swarm/diagnostics
+        with torch.no_grad():
+            res_norm = torch.norm(x_target_frozen - prediction_grad, dim=-1).mean().item()
+
         if unbatched:
             out = out.squeeze(0)
             
-        return out.to(original_dtype), iters_run
+        return out.to(original_dtype), iters_run, res_norm
 
 
 class PPCGraphLLM(nn.Module):
