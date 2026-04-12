@@ -64,13 +64,14 @@ class ShardedPPCGraphLLM(nn.Module):
             res_energies.append(res_norm)
 
         # Move all scalars to device1 before sum to avoid cross-device error
-        avg_energy = (sum(e.to(self.device1) for e in res_energies) / len(res_energies)).item()
+        layer_energies = torch.stack([e.to(self.device1) for e in res_energies])
+        avg_energy = layer_energies.mean()
 
         # Final decoding on device1
         x_flat = x.flatten(-2) # [..., 2D]
         x_norm = self.layer_norm(x_flat)
         logits = self.output_head(x_norm)
-        return logits, total_iters / self.num_layers, avg_energy
+        return logits, total_iters / self.num_layers, avg_energy, layer_energies
 
     @torch.no_grad()
     def swarm_forward(self, input_ids: torch.Tensor, swarm_size: int = 8, local_iters: int = 16):
@@ -142,7 +143,7 @@ class ShardedPPCGraphLLM(nn.Module):
     def generate(self, input_ids: torch.Tensor, max_new_tokens: int = 50, local_iters: int = 8, temperature: float = 1.0):
         device = input_ids.device
         for _ in range(max_new_tokens):
-            logits, _, _ = self.forward(input_ids, local_iters=local_iters)
+            logits, _, _, _ = self.forward(input_ids, local_iters=local_iters)
             next_token_logits = logits[:, -1, :] / max(1e-6, temperature)
             next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
             input_ids = torch.cat([input_ids, next_token.to(device)], dim=1)

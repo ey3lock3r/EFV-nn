@@ -3,6 +3,25 @@ import torch.nn as nn
 import math
 from efv_nn.ppc_core import ExpertChoiceMoEMatcher
 
+
+def spectral_guardian_penalty(layer_energies: torch.Tensor, lam: float = 0.01) -> torch.Tensor:
+    """
+    Phasal Laplacian Regularization (Spectral Guardian — Pillar 2).
+
+    Penalizes high-frequency 'jitter' between adjacent layer energies.
+    Formula: λ · Σ (E_i - E_{i+1})²
+
+    Args:
+        layer_energies: [num_layers] tensor on device1.
+        lam: Penalty strength. Default 0.01 (gentle guardian).
+
+    Returns:
+        Scalar penalty tensor on the same device. Zero graph breaks.
+    """
+    diff = layer_energies[1:] - layer_energies[:-1]  # [num_layers - 1]
+    return lam * (diff ** 2).sum()
+
+
 class PPCNodeLayer(nn.Module):
     def __init__(self, hidden_dim, num_experts=4, local_lr=0.5, lr_decay=0.85, tolerance=1e-3, use_jacobian=False):
         super().__init__()
