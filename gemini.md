@@ -25,6 +25,7 @@
     - **Signature Alignment:** Integrated `E (Energy)` return into all model methods (+forward/generate). Energy monitoring is now our primary "Internal Signal" for training stability.
     - **Global Model Pattern:** Transitioned notebook to decoupled architecture. 3.2B instantiation and checkpoint loading moved to a dedicated 'Setup' cell. Enables instant Train <-> Verify switching and live hot-patching without reloading VRAM.
     - **Inductor Optimization (Island only):** Removed redundant global `torch.compile(model)` in favor of class-internal per-layer compilation. Prevents cross-device graph breaks and reduces cold-start latency.
+    - **NaN Stability:** Added `torch.clamp([-10, 10])` to the PPC update logic. Fixes explosive gradient updates common in early training with Jacobian-enabled MoE.
 - **[2026-04-11] 3.2B + Inductor Optimization:**
     - **Vectorized MoE (Speed Fix):** Serial Python loop was the bottleneck. Migrated to **Batch-BMM** `[E, K, D]`.
     - **Zero-Break Fusion:** Identified **Early-Stopping Break** as a 384-sync/step bottleneck. Migrated to **Static-Length Loops** for 100% Inductor fusion. Result: Fused 16-step GPU burst >> 5-step synced sync. [Duration Delta: TBD ms/step]
