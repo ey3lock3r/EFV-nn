@@ -61,7 +61,7 @@ class ShardedPPCGraphLLM(nn.Module):
             x, iters, res_norm = layer(x, local_iters)
             x = x.clone() # Isolation: Prevent CUDA Graph buffer overwrite in loops
             total_iters += iters
-            res_energies.append(res_norm)
+            res_energies.append(res_norm.clone())
 
         # Move all scalars to device1 before sum to avoid cross-device error
         layer_energies = torch.stack([e.to(self.device1) for e in res_energies])

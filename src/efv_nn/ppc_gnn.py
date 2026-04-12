@@ -157,7 +157,7 @@ class PPCGraphLLM(nn.Module):
         for layer in self.layers:
             x, iters, res_norm = layer(x, local_iters)
             total_iters += iters
-            res_energies.append(res_norm)
+            res_energies.append(res_norm.clone())
 
         layer_energies = torch.stack(res_energies)
         avg_energy = layer_energies.mean()
