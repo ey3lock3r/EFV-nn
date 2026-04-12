@@ -11,7 +11,7 @@
 - **Testing:** `pytest` (AAA).
 ## 3. Protocol & Workflow
 - **Loop:** `src/` (canonical) → **Pre-Flight Review** → **Execution** → **Log & Hygiene** → **Push** → **Notebook Pull**.
-- **Pre-Flight:** Before any change, perform a **SINGLE** holistic check of math parity, logic, engine constraints (`compile`/`autocast`), and **Sync Isolation** (Zero `.item()`/`.cpu()` calls in inner loops).
+- **Pre-Flight:** Before any change, perform a **SINGLE** holistic check of math parity, logic, engine constraints (`compile`/`autocast`), and **Efficiency Purity** (Zero Syncs like `.item()`, Zero redundant device transfers, and Zero Graph Breaks in core loops).
 - **High-Density Logging:** Log insights mid-flow using shorthand to maintain **Zero Information Loss** (ensure 100% architectural memory).
 - **Hygiene:** Immediate cleanup of scratch/temp files. Maintain `task.md` as the living status.
 - **No Duplication:** Never duplicate library code inside notebooks. Pull from master.
