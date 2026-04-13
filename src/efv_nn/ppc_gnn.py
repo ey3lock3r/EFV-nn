@@ -50,64 +50,67 @@ class PPCNodeLayer(nn.Module):
         # Holistic move: PPC iterations MUST be float32 for convergence stability
         x_stream = x_stream.float()
 
-        B, T, D, _ = x_stream.shape
-        iters_run = 0
-        
-        # 1. Local Convergence (Frozen fixed point search)
-        with torch.no_grad():
-            x_states = x_stream.clone().detach()
+        # Pillar 4: Autocast Isolation. We force everything into FP32 to prevent 
+        # compiler-drift in the iterative loop, ensuring E ~ 0.024 baseline.
+        with torch.amp.autocast('cuda', enabled=False):
+            B, T, D, _ = x_stream.shape
+            iters_run = 0
             
-            # Rotation buffers are typically float32, math should preserve it
-            x_prev = x_states[:, :-1, :, :] # [B, T-1, D, 2]
-            prev_r, prev_i = x_prev[..., 0], x_prev[..., 1]
-            
-            rot_r = prev_r * self.cos_p - prev_i * self.sin_p
-            rot_i = prev_r * self.sin_p + prev_i * self.cos_p
-            rot_prev = torch.stack([rot_r, rot_i], dim=-1)
-            
-            x_target_frozen = torch.zeros_like(x_states, dtype=torch.float32)
-            x_target_frozen[:, 1:, :, :] = rot_prev
-            x_target_frozen[:, 0, :, :] = x_states[:, 0, :, :]
-            
-            # Fixed-length loop for peak fusion: 16 small fused steps > 5 synced steps
-            current_lr = self.base_local_lr
-            for i in range(local_iters):
-                iters_run += 1
-                prediction, indices, scores, counts = self.moe(x_states.reshape(B*T, D, 2), gate_bias=gate_bias)
-                prediction = prediction.float().reshape(B, T, D, 2)
-                residual = x_target_frozen - prediction
+            # 1. Local Convergence (Frozen fixed point search)
+            with torch.no_grad():
+                x_states = x_stream.clone().detach()
+                
+                # Rotation buffers are typically float32, math should preserve it
+                x_prev = x_states[:, :-1, :, :] # [B, T-1, D, 2]
+                prev_r, prev_i = x_prev[..., 0], x_prev[..., 1]
+                
+                rot_r = prev_r * self.cos_p - prev_i * self.sin_p
+                rot_i = prev_r * self.sin_p + prev_i * self.cos_p
+                rot_prev = torch.stack([rot_r, rot_i], dim=-1)
+                
+                x_target_frozen = torch.zeros_like(x_states, dtype=torch.float32)
+                x_target_frozen[:, 1:, :, :] = rot_prev
+                x_target_frozen[:, 0, :, :] = x_states[:, 0, :, :]
+                
+                # Fixed-length loop for peak fusion: 16 small fused steps > 5 synced steps
+                current_lr = self.base_local_lr
+                for i in range(local_iters):
+                    iters_run += 1
+                    prediction, indices, scores, counts = self.moe(x_states.reshape(B*T, D, 2), gate_bias=gate_bias)
+                    prediction = prediction.float().reshape(B, T, D, 2)
+                    residual = x_target_frozen - prediction
 
-                if self.use_jacobian:
-                    step = self.moe.transpose_forward(
-                        residual.reshape(B*T, D, 2), indices, scores, counts
-                    ).float().reshape(B, T, D, 2)
-                    # Safety Clamp: Prevent explosive updates in early random-weight phase
-                    x_states.add_(torch.clamp(step, -10.0, 10.0), alpha=current_lr)
-                else:
-                    x_states.add_(torch.clamp(residual, -10.0, 10.0), alpha=current_lr)
-                    
-                current_lr *= self.lr_decay
-        
-        # 2. DEQ Gradient Attachment
-        # Everything here stays in float32 for the analytical bridge
-        x_prev_grad = x_stream[:, :-1, :, :]
-        pg_r, pg_i = x_prev_grad[..., 0], x_prev_grad[..., 1]
-        rg_r = pg_r * self.cos_p - pg_i * self.sin_p
-        rg_i = pg_r * self.sin_p + pg_i * self.cos_p
-        
-        x_target_grad = torch.zeros_like(x_stream, dtype=torch.float32)
-        x_target_grad[:, 1:, :, 0] = rg_r
-        x_target_grad[:, 1:, :, 1] = rg_i
-        x_target_grad[:, 0, :, :] = x_stream[:, 0, :, :]
-        
-        prediction_grad, _, _, _ = self.moe(x_states.reshape(B*T, D, 2))
-        prediction_grad = prediction_grad.float().reshape(B, T, D, 2)
-        
-        # Bridge uses un-decayed base_local_lr
-        out = x_states + self.base_local_lr * (x_target_grad - prediction_grad)
-        
-        # Calculate final resonance energy (L2 norm of error) for swarm/diagnostics
-        with torch.no_grad():
+                    if self.use_jacobian:
+                        step = self.moe.transpose_forward(
+                            residual.reshape(B*T, D, 2), indices, scores, counts
+                        ).float().reshape(B, T, D, 2)
+                        # Safety Clamp: Prevent explosive updates in early random-weight phase
+                        x_states.add_(torch.clamp(step, -10.0, 10.0), alpha=current_lr)
+                    else:
+                        x_states.add_(torch.clamp(residual, -10.0, 10.0), alpha=current_lr)
+                        
+                    current_lr *= self.lr_decay
+            
+            # 2. DEQ Gradient Attachment
+            # Everything here stays in float32 for the analytical bridge
+            x_prev_grad = x_stream[:, :-1, :, :]
+            pg_r, pg_i = x_prev_grad[..., 0], x_prev_grad[..., 1]
+            rg_r = pg_r * self.cos_p - pg_i * self.sin_p
+            rg_i = pg_r * self.sin_p + pg_i * self.cos_p
+            
+            x_target_grad = torch.zeros_like(x_stream, dtype=torch.float32)
+            x_target_grad[:, 1:, :, 0] = rg_r
+            x_target_grad[:, 1:, :, 1] = rg_i
+            x_target_grad[:, 0, :, :] = x_stream[:, 0, :, :]
+            
+            prediction_grad, _, _, _ = self.moe(x_states.reshape(B*T, D, 2))
+            prediction_grad = prediction_grad.float().reshape(B, T, D, 2)
+            
+            # Bridge uses un-decayed base_local_lr
+            out = x_states + self.base_local_lr * (x_target_grad - prediction_grad)
+            
+            # Calculate final resonance energy (L2 norm of error) for swarm/diagnostics
+            # Remove no_grad() to allow Spectral Guardian to penalise phasal jitter
             res_norm = torch.norm(x_target_frozen - prediction_grad, dim=-1).mean()
 
         if unbatched:
