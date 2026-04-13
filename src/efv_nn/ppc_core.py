@@ -114,15 +114,17 @@ class ExpertChoiceMoEMatcher(nn.Module):
         x_batched = x[flat_indices].view(self.num_experts, k_nodes, D, 2)
 
         # 3. Vectorized Complex BMM: (xr + i*xi)(wr + i*wi)
-        # Pillar 4 Optimization: Manual hardware-native FP16 scope to reclaim max Tensor Core speed.
-        xr_h, xi_h = x_batched[..., 0].half(), x_batched[..., 1].half()
-        # experts_weight_real is already natively .half()
-        wr_h, wi_h = self.experts_weight_real[..., 0].half(), self.experts_weight_real[..., 1].half()
+        # Pillar 4 Optimization: Managed hardware-native FP16 scope to reclaim max Tensor Core speed.
+        # Autocast automatically handles the non-contiguous slices safely (preventing Illegal Memory Access).
+        xr, xi = x_batched[..., 0], x_batched[..., 1]
+        wr, wi = self.experts_weight_real[..., 0], self.experts_weight_real[..., 1]
 
-        # Fast FP16 multiplication, instantly cast back to f32 for accumulation safety
-        yr = torch.matmul(xr_h, wr_h).float() - torch.matmul(xi_h, wi_h).float()
-        yi = torch.matmul(xr_h, wi_h).float() + torch.matmul(xi_h, wr_h).float()
-        y_all = torch.stack([yr, yi], dim=-1) # [E, k, D, 2]
+        with torch.amp.autocast('cuda', enabled=True):
+            yr = torch.matmul(xr, wr) - torch.matmul(xi, wi)
+            yi = torch.matmul(xr, wi) + torch.matmul(xi, wr)
+
+        # Result is safely transitioned back to f32 for accumulation
+        y_all = torch.stack([yr.float(), yi.float()], dim=-1) # [E, k, D, 2]
 
         # 4. Score Weighting
         # topk_scores: [k, E] -> weights: [E, k, 1, 1]
@@ -158,14 +160,16 @@ class ExpertChoiceMoEMatcher(nn.Module):
         res_batched = residual[flat_indices].view(self.num_experts, k_nodes, D, 2)
 
         # W^H = [W_r^T, -W_i^T].
-        # Pillar 4 Optimization: Jacobian precision matches the forward pass (Manual FP16)
-        yr_h, yi_h = res_batched[..., 0].half(), res_batched[..., 1].half()
-        wr_t = self.experts_weight_real[..., 0].transpose(-2, -1).half()
-        wi_t = self.experts_weight_real[..., 1].transpose(-2, -1).half()
+        # Pillar 4 Optimization: Jacobian precision managed via Localized Autocast
+        yr, yi = res_batched[..., 0], res_batched[..., 1]
+        wr_t = self.experts_weight_real[..., 0].transpose(-2, -1)
+        wi_t = self.experts_weight_real[..., 1].transpose(-2, -1)
         
-        grad_r = torch.matmul(yr_h, wr_t).float() + torch.matmul(yi_h, wi_t).float()
-        grad_i = torch.matmul(yi_h, wr_t).float() - torch.matmul(yr_h, wi_t).float()
-        grad_all = torch.stack([grad_r, grad_i], dim=-1) # [E, k, D, 2]
+        with torch.amp.autocast('cuda', enabled=True):
+            grad_r = torch.matmul(yr, wr_t) + torch.matmul(yi, wi_t)
+            grad_i = torch.matmul(yi, wr_t) - torch.matmul(yr, wi_t)
+        
+        grad_all = torch.stack([grad_r.float(), grad_i.float()], dim=-1) # [E, k, D, 2]
 
         # Weighting
         weights = topk_scores.T.reshape(self.num_experts, k_nodes, 1, 1).to(grad_all.dtype)
