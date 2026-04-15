@@ -127,12 +127,20 @@ class ShardedPPCGraphLLM(nn.Module):
         return logits, total_iters / self.num_layers, winner_energy
 
     @torch.no_grad()
-    def generate_swarm(self, input_ids: torch.Tensor, max_new_tokens: int = 50, swarm_size: int = 8, local_iters: int = 16, temperature: float = 1.0):
+    def generate_swarm(self, input_ids: torch.Tensor, max_new_tokens: int = 50, swarm_size: int = 8, local_iters: int = 16, temperature: float = 1.0, top_k: int = 40):
         device = input_ids.device
         for _ in range(max_new_tokens):
             logits, _, _ = self.swarm_forward(input_ids, swarm_size=swarm_size, local_iters=local_iters)
             next_token_logits = logits[:, -1, :] / max(1e-6, temperature)
-            next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+            
+            # Top-K Sampling to prevent greedy repetition
+            if top_k > 0:
+                indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
+                next_token_logits[indices_to_remove] = -float('Inf')
+            
+            probs = torch.nn.functional.softmax(next_token_logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+            
             input_ids = torch.cat([input_ids, next_token.to(device)], dim=1)
             
             if next_token.item() == 128001:
@@ -140,12 +148,20 @@ class ShardedPPCGraphLLM(nn.Module):
         return input_ids
 
     @torch.no_grad()
-    def generate(self, input_ids: torch.Tensor, max_new_tokens: int = 50, local_iters: int = 8, temperature: float = 1.0):
+    def generate(self, input_ids: torch.Tensor, max_new_tokens: int = 50, local_iters: int = 8, temperature: float = 1.0, top_k: int = 40):
         device = input_ids.device
         for _ in range(max_new_tokens):
             logits, _, _, _ = self.forward(input_ids, local_iters=local_iters)
             next_token_logits = logits[:, -1, :] / max(1e-6, temperature)
-            next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+            
+            # Top-K Sampling
+            if top_k > 0:
+                indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
+                next_token_logits[indices_to_remove] = -float('Inf')
+                
+            probs = torch.nn.functional.softmax(next_token_logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+            
             input_ids = torch.cat([input_ids, next_token.to(device)], dim=1)
             
             if next_token.item() == 128001:
