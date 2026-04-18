@@ -23,7 +23,7 @@ def spectral_guardian_penalty(layer_energies: torch.Tensor, lam: float = 0.01) -
 
 
 class PPCNodeLayer(nn.Module):
-    def __init__(self, hidden_dim, num_experts=4, local_lr=0.5, lr_decay=0.85, tolerance=1e-3, use_jacobian=False):
+    def __init__(self, hidden_dim, num_experts=4, local_lr=0.5, lr_decay=0.85, tolerance=1e-3, use_jacobian=False, prime_delays=(1, 2, 3, 5)):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.base_local_lr = max(0.0, min(0.99, local_lr))
@@ -31,12 +31,41 @@ class PPCNodeLayer(nn.Module):
         self.tolerance = tolerance
         self.use_jacobian = use_jacobian
         
+        # OCNS Integration: Phasal Delay Embedding Gains
+        self.prime_delays = list(prime_delays) if prime_delays else []
+        if self.prime_delays:
+            # Shape: [num_delays, hidden_dim, 2] - allows complex scaling and phase rotation
+            self.delay_gains = nn.Parameter(torch.zeros(len(self.prime_delays), hidden_dim, 2))
+        
         # Phase rotation parameters: store as cos/sin for manual rotation
         phase = torch.rand(hidden_dim) * 2 * math.pi
         self.register_buffer('cos_p', torch.cos(phase))
         self.register_buffer('sin_p', torch.sin(phase))
         
         self.moe = ExpertChoiceMoEMatcher(hidden_dim, num_experts)
+        
+    def _apply_ocns_delays(self, x_states):
+        """Applies Phasal Delay Embedding (OCNS)."""
+        if not self.prime_delays:
+            return x_states
+            
+        x_eff = x_states.clone()
+        for idx, tau in enumerate(self.prime_delays):
+            delayed = torch.roll(x_states, shifts=tau, dims=1)
+            # Mask the wrapped-around tokens
+            delayed[:, :tau, :, :] = 0.0
+            
+            # Complex Multiplication: (dr + i*di) * (gr + i*gi)
+            dr, di = delayed[..., 0], delayed[..., 1]
+            gr, gi = self.delay_gains[idx, ..., 0], self.delay_gains[idx, ..., 1]
+            
+            eff_r = dr * gr - di * gi
+            eff_i = dr * gi + di * gr
+            
+            x_eff[..., 0] += eff_r
+            x_eff[..., 1] += eff_i
+            
+        return x_eff
         
     def forward(self, x_stream, local_iters=8, gate_bias=None):
         """
@@ -76,7 +105,11 @@ class PPCNodeLayer(nn.Module):
                 current_lr = self.base_local_lr
                 for i in range(local_iters):
                     iters_run += 1
-                    prediction, indices, scores, counts = self.moe(x_states.reshape(B*T, D, 2), gate_bias=gate_bias)
+                    
+                    # --- OCNS INJECTION POINT 1 ---
+                    x_eff = self._apply_ocns_delays(x_states)
+                    
+                    prediction, indices, scores, counts = self.moe(x_eff.reshape(B*T, D, 2), gate_bias=gate_bias)
                     prediction = prediction.float().reshape(B, T, D, 2)
                     residual = x_target_frozen - prediction
 
@@ -103,7 +136,10 @@ class PPCNodeLayer(nn.Module):
             x_target_grad[:, 1:, :, 1] = rg_i
             x_target_grad[:, 0, :, :] = x_stream[:, 0, :, :]
             
-            prediction_grad, _, _, _ = self.moe(x_states.reshape(B*T, D, 2))
+            # --- OCNS INJECTION POINT 2 (Gradient Path) ---
+            x_eff_grad = self._apply_ocns_delays(x_states)
+            
+            prediction_grad, _, _, _ = self.moe(x_eff_grad.reshape(B*T, D, 2))
             prediction_grad = prediction_grad.float().reshape(B, T, D, 2)
             
             # Bridge uses un-decayed base_local_lr

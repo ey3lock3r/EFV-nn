@@ -6,7 +6,7 @@ from efv_nn.ppc_gnn import PPCNodeLayer
 
 class ShardedPPCGraphLLM(nn.Module):
     def __init__(self, vocab_size: int, hidden_dim: int = 1024, num_layers: int = 24,
-                 num_experts: int = 64, local_lr: float = 0.5, lr_decay: float = 0.85, use_jacobian: bool = False):
+                 num_experts: int = 64, local_lr: float = 0.5, lr_decay: float = 0.85, use_jacobian: bool = False, prime_delays=(1, 2, 3, 5)):
         super().__init__()
         self.vocab_size = vocab_size
         self.hidden_dim = hidden_dim
@@ -30,7 +30,7 @@ class ShardedPPCGraphLLM(nn.Module):
         self.layers = nn.ModuleList()
         for i in range(num_layers):
             target_device = self.device0 if i < self.split_point else self.device1
-            layer = PPCNodeLayer(hidden_dim, num_experts=num_experts, local_lr=local_lr, lr_decay=lr_decay, use_jacobian=use_jacobian).to(target_device)
+            layer = PPCNodeLayer(hidden_dim, num_experts=num_experts, local_lr=local_lr, lr_decay=lr_decay, use_jacobian=use_jacobian, prime_delays=prime_delays).to(target_device)
             
             # Island Optimization: Compile each layer individually to avoid Multi-Device Graph Breaks
             compiled_layer = torch.compile(layer, mode="reduce-overhead")
