@@ -45,25 +45,26 @@ class PPCNodeLayer(nn.Module):
         self.moe = ExpertChoiceMoEMatcher(hidden_dim, num_experts)
         
     def _apply_ocns_delays(self, x_states):
-        """Applies Phasal Delay Embedding (OCNS)."""
+        """Memory-Efficient Phasal Delay Embedding (OCNS)."""
         if not self.prime_delays:
             return x_states
             
+        # Start with a copy of current states
         x_eff = x_states.clone()
+        
+        # We use Slicing (Views) instead of Roll (Copies) to save VRAM
         for idx, tau in enumerate(self.prime_delays):
-            delayed = torch.roll(x_states, shifts=tau, dims=1)
-            # Mask the wrapped-around tokens
-            delayed[:, :tau, :, :] = 0.0
-            
-            # Complex Multiplication: (dr + i*di) * (gr + i*gi)
-            dr, di = delayed[..., 0], delayed[..., 1]
+            # Complex Gains
             gr, gi = self.delay_gains[idx, ..., 0], self.delay_gains[idx, ..., 1]
             
-            eff_r = dr * gr - di * gi
-            eff_i = dr * gi + di * gr
+            # Source (History): tokens from 0 to T-tau
+            # Target (Present): tokens from tau to T
+            dr = x_states[:, :-tau, ..., 0]
+            di = x_states[:, :-tau, ..., 1]
             
-            x_eff[..., 0] += eff_r
-            x_eff[..., 1] += eff_i
+            # Interference Math (In-place addition to Target slice)
+            x_eff[:, tau:, ..., 0] += (dr * gr - di * gi)
+            x_eff[:, tau:, ..., 1] += (dr * gi + di * gr)
             
         return x_eff
         
