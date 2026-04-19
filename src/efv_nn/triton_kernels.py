@@ -59,13 +59,14 @@ def fused_phase_rotation(x_states, cos_p, sin_p, out=None):
     
     BLOCK_D = triton.next_power_of_2(D)
     # The kernel operates on flat (B*T) rows
-    _phase_rotation_kernel[(B * T,)](
-        x_states.contiguous(), 
-        cos_p.contiguous(), 
-        sin_p.contiguous(), 
-        out,
-        T=T, D=D, BLOCK_D=BLOCK_D,
-    )
+    with torch.cuda.device(x_states.device):
+        _phase_rotation_kernel[(B * T,)](
+            x_states.contiguous(), 
+            cos_p.contiguous(), 
+            sin_p.contiguous(), 
+            out,
+            T=T, D=D, BLOCK_D=BLOCK_D,
+        )
     return out
 
 
@@ -129,15 +130,16 @@ def fused_ocns_delay(x_states, delay_gains, prime_delays, out=None):
     
     padded  = list(prime_delays) + [0] * (8 - len(prime_delays))
     BLOCK_D = triton.next_power_of_2(D)
-    _ocns_delay_kernel[(B * T,)](
-        x_states.contiguous(), 
-        delay_gains.contiguous(), 
-        out,
-        tau0=padded[0], tau1=padded[1], tau2=padded[2], tau3=padded[3],
-        tau4=padded[4], tau5=padded[5], tau6=padded[6], tau7=padded[7],
-        num_delays=len(prime_delays),
-        T=T, D=D, BLOCK_D=BLOCK_D,
-    )
+    with torch.cuda.device(x_states.device):
+        _ocns_delay_kernel[(B * T,)](
+            x_states.contiguous(), 
+            delay_gains.contiguous(), 
+            out,
+            tau0=padded[0], tau1=padded[1], tau2=padded[2], tau3=padded[3],
+            tau4=padded[4], tau5=padded[5], tau6=padded[6], tau7=padded[7],
+            num_delays=len(prime_delays),
+            T=T, D=D, BLOCK_D=BLOCK_D,
+        )
     return out
 
 
@@ -170,11 +172,12 @@ def fused_state_update(x_states, step, current_lr):
     numel = x_states.numel()
     BLOCK = 1024
     grid  = ((numel + BLOCK - 1) // BLOCK,)
-    _state_update_kernel[grid](
-        x_states, 
-        step.contiguous(),
-        lr=float(current_lr), numel=numel, BLOCK=BLOCK,
-    )
+    with torch.cuda.device(x_states.device):
+        _state_update_kernel[grid](
+            x_states, 
+            step.contiguous(),
+            lr=float(current_lr), numel=numel, BLOCK=BLOCK,
+        )
 
 
 # ============================================================
@@ -221,11 +224,12 @@ def fused_normalize_activate(output, counts, bias, out=None):
         out = torch.empty_like(output)
     
     BLOCK_D = triton.next_power_of_2(D)
-    _normalize_activate_kernel[(B_T,)](
-        output.contiguous(), 
-        counts.contiguous().view(-1), 
-        bias.contiguous(), 
-        out,
-        B_T=B_T, D=D, BLOCK_D=BLOCK_D,
-    )
+    with torch.cuda.device(output.device):
+        _normalize_activate_kernel[(B_T,)](
+            output.contiguous(), 
+            counts.contiguous().view(-1), 
+            bias.contiguous(), 
+            out,
+            B_T=B_T, D=D, BLOCK_D=BLOCK_D,
+        )
     return out
