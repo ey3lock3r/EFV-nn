@@ -1,9 +1,10 @@
 """
-Triton Kernels for PPC-GNN (Triton 3.6.0 - Final In-Place Edition).
+Triton Kernels for PPC-GNN (Triton 3.6.0 - Deep Stability Edition).
 
-Fix:
-  - Removed .float() from wrappers to allow in-place updates.
-  - Calling code (ppc_gnn.py) now ensures tensors are FP32 before calling.
+Safety Reinforcements:
+  - In-place Contiguity: Added assertions to ensure in-place updates never hit a copy.
+  - NaN-Siphon: State updates now explicitly discard NaN steps (set to 0).
+  - NaN-Proof Normalize: Activation kernel now handles both inf and nan safely.
 """
 
 import torch
@@ -152,16 +153,21 @@ def _state_update_kernel(
     x = tl.load(x_states_ptr + off, mask=mask, other=0.0)
     s = tl.load(step_ptr      + off, mask=mask, other=0.0)
 
+    # NaN Protection: Set NaN steps to 0 (Siphon effect)
+    s = tl.where(tl.isnan(s), 0.0, s)
+
     s_clamped = tl.minimum(tl.maximum(s, -10.0), 10.0)
     tl.store(x_states_ptr + off, x + lr * s_clamped, mask=mask)
 
 
 def fused_state_update(x_states, step, current_lr):
+    # CRITICAL: Assertion to prevent copy-bug regression
+    assert x_states.is_contiguous(), "State update must be in-place on contiguous tensor"
     numel = x_states.numel()
     BLOCK = 1024
     grid  = ((numel + BLOCK - 1) // BLOCK,)
     _state_update_kernel[grid](
-        x_states.contiguous(), 
+        x_states, # Pass directly for in-place
         step.contiguous(),
         lr=float(current_lr), numel=numel, BLOCK=BLOCK,
     )
@@ -186,13 +192,16 @@ def _normalize_activate_kernel(
     r = tl.load(output_ptr + row + d_off * 2,     mask=mask, other=0.0) / count
     i = tl.load(output_ptr + row + d_off * 2 + 1, mask=mask, other=0.0) / count
 
-    # Safe Normalize: prevent inf/inf = NaN
-    mag           = tl.sqrt(r * r + i * i)
-    is_inf        = (mag > 1e18) 
-    safe_mag      = tl.where(tl.broadcast_to(is_inf, (BLOCK_D,)), 1.0, tl.maximum(mag, 1e-8))
+    # Safe Normalize: prevent inf/nan poisoning
+    mag    = tl.sqrt(r * r + i * i)
+    is_bad = (mag > 1e18) | tl.isnan(mag)
     
+    # Broadcast condition
+    bad_mask = tl.broadcast_to(is_bad, (BLOCK_D,))
+    
+    safe_mag      = tl.where(bad_mask, 1.0, tl.maximum(mag, 1e-8))
     bias          = tl.load(bias_ptr + d_off, mask=mask, other=0.0)
-    activated_mag = tl.where(tl.broadcast_to(is_inf, (BLOCK_D,)), 1e18, tl.maximum(mag + bias, 0.0))
+    activated_mag = tl.where(bad_mask, 0.0, tl.maximum(mag + bias, 0.0))
 
     tl.store(result_ptr + row + d_off * 2,     (r / safe_mag) * activated_mag, mask=mask)
     tl.store(result_ptr + row + d_off * 2 + 1, (i / safe_mag) * activated_mag, mask=mask)
