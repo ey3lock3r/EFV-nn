@@ -43,8 +43,13 @@
     - **Axiom: Syntactic Mastery**: At 10M tokens (Step 20k), 3.2B PPC-GNN achieves perfect syntax (punctuation/preposition clustering) without semantic coherence. Loss floor breached at `7.39`.
     - **Axiom: Phasal Annealing**: To break the final 7.5 plateau, LR must drop to micro-scale (`1e-6`) to force gradients out of the "wandering valley" and into absolute factual minima.
     - **Axiom: OCNS Memory Hygiene**: `torch.roll` inside iterative loops (48 iters) triggers OOM via activation-buffer explosion. **Fix**: Use zero-copy Slicing (Views) for temporal shifts to maintain dual-T4 feasibility.
-    - **Axiom: Triton Dual-Path**: Fuse elementwise ops (phase rotation, OCNS delay, state update, normalize+activate) into Triton kernels. Use Python path as fallback + ground truth. Eliminates `torch.compile` cold-start entirely.
-    - **Axiom: APD Floor**: Adaptive Phasal Depth uses learnable `exit_threshold` with mandatory `min_iters=8` floor. Initialized large (1e3) so full iterations run at first. Avoids graph break via threshold check in no_grad loop only.
+    - **Axiom: Triton Dual-Path**: Keep Python reference logic alongside Triton kernels for parity testing.
+    - **Axiom: APD Floor**: Adaptive Phasal Depth MUST have a hard `min_iters` floor (e.g., 8) to prevent model collapse.
+    - **Axiom: Triton 3.6 Strictness**: `tl.where` on scalars is illegal. Use boolean math or broadcasted block masks.
+    - **Axiom: The In-Place Copy Trap**: Calling `.float()` or `.contiguous()` inside a Triton wrapper creates a **copy**. If the kernel is in-place, it updates the copy and leaves the original stale. Always cast to FP32 *before* the loop.
+    - **Axiom: NaN-Siphon Principle**: In iterative models, use `tl.where(tl.isnan(step), 0.0, step)` inside the update kernel to prevent a single bad expert from poisoning the entire state.
+    - **Axiom: Zero-Product NaN**: In Triton, `0.0 * inf` equals `NaN`. Never use multiplication as a mask for potentially infinite values; use strict `tl.where` gating.
+    - **Axiom: The Self-Binding Trap**: Assigning a pure function to `self.func` makes it a **method**. Calling `self.func()` will inject `self` as the first argument. Always call external kernels as imported functions, never as instance attributes.
 - **[2026-04-15] Infrastructure & Diagnostic Stability:**
     - **Axiom: Hook Safety**: Mandatory `try/finally` for hooks on live models. Prevents OOM/Perf-leaks.
     - **Axiom: Timer Integrity**: Reset `t0` post-disk I/O (7.5GB saves) to stop metric inflation.

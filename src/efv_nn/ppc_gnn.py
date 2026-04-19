@@ -59,10 +59,6 @@ class PPCNodeLayer(nn.Module):
                     fused_state_update,
                     fused_normalize_activate,
                 )
-                self._fused_phase_rotation = fused_phase_rotation
-                self._fused_ocns_delay = fused_ocns_delay
-                self._fused_state_update = fused_state_update
-                self._fused_normalize_activate = fused_normalize_activate
                 self._triton_available = True
             except (ImportError, Exception):
                 pass  # Silent fallback to Python path
