@@ -184,8 +184,10 @@ class PPCNodeLayer(nn.Module):
 
                     # --- Adaptive Phasal Depth: Early Exit (Check every 8 iters to avoid sync overhead) ---
                     if (i + 1) >= self.min_iters and (i + 1) % 8 == 0:
-                        # Optimization: Use squared norm (averaged) to avoid sync and sqrt
-                        res_sq = torch.mean(residual * residual) * 2
+                        # Optimization: Use Max Token Error instead of Global Mean to avoid dilution.
+                        # This ensures the model thinks until the hardest token is satisfied.
+                        token_res_sq = torch.mean(residual * residual, dim=(-2, -1)) * 2 # [B, T]
+                        res_sq = torch.max(token_res_sq)
                         if res_sq.item() < exit_thr_sq:
                             break
                         if torch.isnan(res_sq):
