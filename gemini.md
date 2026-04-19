@@ -112,3 +112,6 @@
 - **Fix: "Weakest Link" Policy**: Switching to `max(token_error)` ensures the model iterates until the **single hardest token** in the batch is satisfied.
 - **The Atomic Limit**: Found that `0.000005` (5 micro-resonance) is the Phase 6 "Sweet Spot." Tightening to `0.000001` leads to "Infinite Thinking" (48 iters) with diminishing returns.
 - **Live-Tune Protocol**: Implementing hyperparameter injection into training signatures allows for real-time precision tuning without kernel restarts.
+- **Learning: VRAM Hygiene (Training vs. Inference)**: In VRAM-constrained environments (Kaggle), stale optimizer states and gradients from training can cause OOMs during generation. Explicit `gc.collect()` and `torch.cuda.empty_cache()` at the start of interactive cells is mandatory.
+- **Learning: Inference "Safety Shield"**: Wrapping notebook generation calls in `with torch.no_grad():` is critical defensive programming to prevent accidental gradient accumulation in sandbox environments.
+- **Learning: Phasal Depth "Snapping"**: Low-frequency APD checks (e.g., every 8 steps) can hide the model's true variance, making it look "robotic." High-frequency audits reveal the underlying adaptive behavior of the phasal wavefront.
