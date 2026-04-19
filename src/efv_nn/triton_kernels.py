@@ -108,7 +108,7 @@ def _ocns_delay_kernel(
         dr = tl.load(x_states_ptr + hist_row + d_off * 2,     mask=hist_mask, other=0.0)
         di = tl.load(x_states_ptr + hist_row + d_off * 2 + 1, mask=hist_mask, other=0.0)
 
-        gain_base = (idx * D * 2).to(tl.int64)
+        gain_base = idx * D * 2
         gr = tl.load(delay_gains_ptr + gain_base + d_off * 2,     mask=mask, other=0.0)
         gi = tl.load(delay_gains_ptr + gain_base + d_off * 2 + 1, mask=mask, other=0.0)
 
