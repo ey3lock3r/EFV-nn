@@ -42,8 +42,8 @@ class PPCNodeLayer(nn.Module):
         self.min_iters = min_iters  # APD: hard floor, model can never learn to skip thinking
 
         # Adaptive Phasal Depth (APD): Learnable exit threshold with hard floor guard.
-        # APD: Adaptive Phasal Depth threshold (0.0001 = 0.01% phasal resonance error)
-        self.exit_threshold = nn.Parameter(torch.tensor(0.0001))
+        # APD: Adaptive Phasal Depth threshold (0.00005 = 0.005% phasal resonance error)
+        self.exit_threshold = nn.Parameter(torch.tensor(0.00005))
 
         # OCNS Integration: Phasal Delay Embedding Gains
         self.prime_delays = list(prime_delays) if prime_delays else []
@@ -127,28 +127,29 @@ class PPCNodeLayer(nn.Module):
                         self._eff_buf    = torch.empty_like(x_states)
                         self._final_buf  = torch.empty_like(x_states)
 
-                # --- Phase Rotation + Target Construction ---
-                if self._triton_available:
-                    x_target_frozen = triton_kernels.fused_phase_rotation(
-                        x_states, self.cos_p, self.sin_p, out=self._target_buf
-                    )
-                else:
-                    x_prev = x_states[:, :-1, :, :]
-                    prev_r, prev_i = x_prev[..., 0], x_prev[..., 1]
-                    rot_r = prev_r * self.cos_p - prev_i * self.sin_p
-                    rot_i = prev_r * self.sin_p + prev_i * self.cos_p
-                    rot_prev = torch.stack([rot_r, rot_i], dim=-1)
-                    x_target_frozen = torch.zeros_like(x_states, dtype=torch.float32)
-                    x_target_frozen[:, 1:, :, :] = rot_prev
-                    x_target_frozen[:, 0, :, :] = x_states[:, 0, :, :]
-
                 # APD: get exit threshold value (clamped to positive, honoring min_iters floor)
-                # We use squared threshold to avoid sqrt on GPU
                 exit_thr_sq = self.exit_threshold.item() ** 2
 
                 current_lr = self.base_local_lr
                 for i in range(local_iters):
                     iters_run += 1
+
+                    # --- PHASE 1: TARGET CONSTRUCTION (MOVING TARGET) ---
+                    # In PPC, the target for x[t] is the phasal rotation of the *current* x[t-1].
+                    # By moving this inside the loop, we force the model to chase a dynamic fixed point.
+                    if self._triton_available:
+                        x_target = triton_kernels.fused_phase_rotation(
+                            x_states, self.cos_p, self.sin_p, out=self._target_buf
+                        )
+                    else:
+                        x_prev = x_states[:, :-1, :, :]
+                        prev_r, prev_i = x_prev[..., 0], x_prev[..., 1]
+                        rot_r = prev_r * self.cos_p - prev_i * self.sin_p
+                        rot_i = prev_r * self.sin_p + prev_i * self.cos_p
+                        rot_prev = torch.stack([rot_r, rot_i], dim=-1)
+                        x_target = torch.zeros_like(x_states, dtype=torch.float32)
+                        x_target[:, 1:, :, :] = rot_prev
+                        x_target[:, 0, :, :] = x_states[:, 0, :, :]
 
                     # --- OCNS INJECTION POINT 1 ---
                     if self._triton_available and self.prime_delays:
@@ -162,7 +163,7 @@ class PPCNodeLayer(nn.Module):
                         x_eff.reshape(B * T, D, 2), gate_bias=gate_bias
                     )
                     prediction = prediction.float().reshape(B, T, D, 2)
-                    residual = x_target_frozen - prediction
+                    residual = x_target - prediction
 
                     if self.use_jacobian:
                         step = self.moe.transpose_forward(
@@ -223,7 +224,23 @@ class PPCNodeLayer(nn.Module):
             
             # Calculate final resonance energy (L2 norm of error) for swarm/diagnostics
             # Remove no_grad() to allow Spectral Guardian to penalise phasal jitter
-            res_norm = torch.norm(x_target_frozen - prediction_grad, dim=-1).mean()
+            # Calculate final resonance energy (L2 norm of error) for swarm/diagnostics
+            # Use a fresh target calculation for the final gradient bridge
+            if self._triton_available:
+                x_target_final = triton_kernels.fused_phase_rotation(
+                    x_states, self.cos_p, self.sin_p, out=self._target_buf
+                )
+            else:
+                x_prev_final = x_states[:, :-1, :, :]
+                prev_r, prev_i = x_prev_final[..., 0], x_prev_final[..., 1]
+                rot_r = prev_r * self.cos_p - prev_i * self.sin_p
+                rot_i = prev_r * self.sin_p + prev_i * self.cos_p
+                rot_prev_final = torch.stack([rot_r, rot_i], dim=-1)
+                x_target_final = torch.zeros_like(x_states, dtype=torch.float32)
+                x_target_final[:, 1:, :, :] = rot_prev_final
+                x_target_final[:, 0, :, :] = x_states[:, 0, :, :]
+
+            res_norm = torch.norm(x_target_final - prediction_grad, dim=-1).mean()
             self.moe.clear_cache()
 
         if unbatched:
