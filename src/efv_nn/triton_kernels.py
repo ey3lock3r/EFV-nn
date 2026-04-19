@@ -5,9 +5,7 @@ Key Triton 3.x rules applied:
   - No `if` on runtime tensors. Use tl.where() and masked loads.
   - All pointer offsets cast to tl.int64 to prevent 32-bit overflow.
   - Scalar float kernel args typed as tl.constexpr where needed.
-
-All kernels operate on [B, T, D, 2] interleaved-real (complex) tensors stored
-contiguously. The last dimension (2) holds [real, imaginary].
+  - Explicit .data_ptr() passing in wrappers for stability.
 """
 
 import torch
@@ -54,20 +52,14 @@ def _phase_rotation_kernel(
 
 
 def fused_phase_rotation(x_states, cos_p, sin_p):
-    """
-    Fused phase rotation + target construction.
-    Args:
-        x_states: [B, T, D, 2] float32 contiguous
-        cos_p:    [D] float32
-        sin_p:    [D] float32
-    Returns:
-        x_target: [B, T, D, 2] float32
-    """
     B, T, D, _ = x_states.shape
     x_target    = torch.empty_like(x_states)
     BLOCK_D     = triton.next_power_of_2(D)
     _phase_rotation_kernel[(B * T,)](
-        x_states.contiguous(), cos_p.contiguous(), sin_p.contiguous(), x_target,
+        x_states.contiguous().data_ptr(), 
+        cos_p.contiguous().data_ptr(), 
+        sin_p.contiguous().data_ptr(), 
+        x_target.data_ptr(),
         T=T, D=D, BLOCK_D=BLOCK_D,
     )
     return x_target
@@ -101,14 +93,14 @@ def _ocns_delay_kernel(
 
         # Only accumulate for tokens that have a valid history
         valid    = t >= tau
-        src_pid  = tl.where(valid, pid - tau, pid)   # clamp to 0 when invalid
+        src_pid  = tl.where(valid, pid - tau, pid)
         hist_row = src_pid * D * 2
         hist_mask = mask & valid
 
         dr = tl.load(x_states_ptr + hist_row + d_off * 2,     mask=hist_mask, other=0.0)
         di = tl.load(x_states_ptr + hist_row + d_off * 2 + 1, mask=hist_mask, other=0.0)
 
-        gain_base = idx * D * 2
+        gain_base = (idx * D * 2)
         gr = tl.load(delay_gains_ptr + gain_base + d_off * 2,     mask=mask, other=0.0)
         gi = tl.load(delay_gains_ptr + gain_base + d_off * 2 + 1, mask=mask, other=0.0)
 
@@ -120,21 +112,14 @@ def _ocns_delay_kernel(
 
 
 def fused_ocns_delay(x_states, delay_gains, prime_delays):
-    """
-    Memory-efficient OCNS delay embedding. All delays fused into one kernel.
-    Args:
-        x_states:     [B, T, D, 2] float32 contiguous
-        delay_gains:  [num_delays, D, 2] float32
-        prime_delays: list[int] (max 8)
-    Returns:
-        x_eff: [B, T, D, 2] float32
-    """
     B, T, D, _ = x_states.shape
     x_eff   = torch.empty_like(x_states)
     padded  = list(prime_delays) + [0] * (8 - len(prime_delays))
     BLOCK_D = triton.next_power_of_2(D)
     _ocns_delay_kernel[(B * T,)](
-        x_states.contiguous(), delay_gains.contiguous(), x_eff,
+        x_states.contiguous().data_ptr(), 
+        delay_gains.contiguous().data_ptr(), 
+        x_eff.data_ptr(),
         tau0=padded[0], tau1=padded[1], tau2=padded[2], tau3=padded[3],
         tau4=padded[4], tau5=padded[5], tau6=padded[6], tau7=padded[7],
         num_delays=len(prime_delays),
@@ -166,18 +151,12 @@ def _state_update_kernel(
 
 
 def fused_state_update(x_states, step, current_lr):
-    """
-    In-place: x_states += current_lr * clamp(step, -10, 10)
-    Args:
-        x_states:   any shape, float32, contiguous (modified in-place)
-        step:       same shape, float32
-        current_lr: float scalar
-    """
     numel = x_states.numel()
     BLOCK = 1024
     grid  = ((numel + BLOCK - 1) // BLOCK,)
     _state_update_kernel[grid](
-        x_states.contiguous(), step.contiguous(),
+        x_states.contiguous().data_ptr(), 
+        step.contiguous().data_ptr(),
         lr=float(current_lr), numel=numel, BLOCK=BLOCK,
     )
 
@@ -212,20 +191,14 @@ def _normalize_activate_kernel(
 
 
 def fused_normalize_activate(output, counts, bias):
-    """
-    Fused: ModReLU(output / counts.clamp(min=1))
-    Args:
-        output: [B_T, D, 2] float32
-        counts: [B_T, 1, 1] float32
-        bias:   [D] float32
-    Returns:
-        result: [B_T, D, 2] float32
-    """
     B_T, D, _ = output.shape
     result  = torch.empty_like(output)
     BLOCK_D = triton.next_power_of_2(D)
     _normalize_activate_kernel[(B_T,)](
-        output.contiguous(), counts.contiguous().view(-1), bias.contiguous(), result,
+        output.contiguous().data_ptr(), 
+        counts.contiguous().data_ptr(), 
+        bias.contiguous().data_ptr(), 
+        result.data_ptr(),
         B_T=B_T, D=D, BLOCK_D=BLOCK_D,
     )
     return result
