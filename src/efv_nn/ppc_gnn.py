@@ -32,7 +32,7 @@ def spectral_guardian_penalty(layer_energies: torch.Tensor, lam: float = 0.01) -
 
 class PPCNodeLayer(nn.Module):
     def __init__(self, hidden_dim, num_experts=4, local_lr=0.5, lr_decay=0.85, tolerance=1e-3,
-                 use_jacobian=False, prime_delays=(1, 2, 3, 5), use_triton=True, min_iters=8):
+                 use_jacobian=False, prime_delays=(1, 2, 3, 5), use_triton=True, min_iters=16):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.base_local_lr = max(0.0, min(0.99, local_lr))
@@ -42,8 +42,8 @@ class PPCNodeLayer(nn.Module):
         self.min_iters = min_iters  # APD: hard floor, model can never learn to skip thinking
 
         # Adaptive Phasal Depth (APD): Learnable exit threshold with hard floor guard.
-        # APD: Adaptive Phasal Depth threshold (0.00005 = 0.005% phasal resonance error)
-        self.exit_threshold = nn.Parameter(torch.tensor(0.00005))
+        # APD: Adaptive Phasal Depth threshold (0.00001 = 0.001% phasal resonance error)
+        self.exit_threshold = nn.Parameter(torch.tensor(0.00001))
 
         # OCNS Integration: Phasal Delay Embedding Gains
         self.prime_delays = list(prime_delays) if prime_delays else []
