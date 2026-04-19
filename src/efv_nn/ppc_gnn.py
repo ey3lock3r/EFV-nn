@@ -113,12 +113,17 @@ class PPCNodeLayer(nn.Module):
 
             # 1. Local Convergence (Frozen fixed point search)
             with torch.no_grad():
+                if torch.isnan(x_stream).any():
+                    print("⚠️ WARNING: Input x_stream contains NaNs!")
+                
                 # Force to float32 for the iterative loop to ensure stability and Triton compatibility
                 x_states = x_stream.clone().detach().float()
 
                 # --- Phase Rotation + Target Construction ---
                 if self._triton_available:
-                    x_target_frozen = self._fused_phase_rotation(
+                    # Call imported functions directly to avoid 'self' binding bug
+                    from efv_nn.triton_kernels import fused_phase_rotation
+                    x_target_frozen = fused_phase_rotation(
                         x_states, self.cos_p, self.sin_p
                     )
                 else:
@@ -141,7 +146,8 @@ class PPCNodeLayer(nn.Module):
 
                     # --- OCNS INJECTION POINT 1 ---
                     if self._triton_available and self.prime_delays:
-                        x_eff = self._fused_ocns_delay(
+                        from efv_nn.triton_kernels import fused_ocns_delay
+                        x_eff = fused_ocns_delay(
                             x_states, self.delay_gains, self.prime_delays
                         )
                     else:
@@ -159,12 +165,14 @@ class PPCNodeLayer(nn.Module):
                         ).float().reshape(B, T, D, 2)
                         # --- State Update ---
                         if self._triton_available:
-                            self._fused_state_update(x_states, step, current_lr)
+                            from efv_nn.triton_kernels import fused_state_update
+                            fused_state_update(x_states, step, current_lr)
                         else:
                             x_states.add_(torch.clamp(step, -10.0, 10.0), alpha=current_lr)
                     else:
                         if self._triton_available:
-                            self._fused_state_update(x_states, residual, current_lr)
+                            from efv_nn.triton_kernels import fused_state_update
+                            fused_state_update(x_states, residual, current_lr)
                         else:
                             x_states.add_(torch.clamp(residual, -10.0, 10.0), alpha=current_lr)
 
