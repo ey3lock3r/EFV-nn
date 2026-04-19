@@ -32,7 +32,7 @@ def spectral_guardian_penalty(layer_energies: torch.Tensor, lam: float = 0.01) -
 
 class PPCNodeLayer(nn.Module):
     def __init__(self, hidden_dim, num_experts=4, local_lr=0.5, lr_decay=0.85, tolerance=1e-3,
-                 use_jacobian=False, prime_delays=(1, 2, 3, 5), use_triton=True, min_iters=16):
+                 use_jacobian=False, prime_delays=(1, 2, 3, 5), use_triton=True, min_iters=8):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.base_local_lr = max(0.0, min(0.99, local_lr))
