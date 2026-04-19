@@ -1,11 +1,11 @@
 """
 Triton Kernels for PPC-GNN (Triton 3.6.0 compatible).
 
-Key Triton 3.6.0 fixes applied:
-  - Removed tl.where() on scalars (now illegal in 3.x).
-  - Used Boolean-to-Integer math for conditional logic.
-  - Explicit .data_ptr() passing for pointer stability.
+Final compliance fixes for Triton 3.6.0:
+  - Pass Tensors directly (Triton auto-assigns *fp32 pointer types).
+  - Branchless math for all conditional logic (replaces tl.where).
   - Explicit tl.int64 casts for all offset calculations.
+  - Manual unrolling of loops to avoid constexpr tuple indexing.
 """
 
 import torch
@@ -28,14 +28,10 @@ def _phase_rotation_kernel(
     d_off = tl.arange(0, BLOCK_D).to(tl.int64)
     mask  = d_off < D
 
-    # t == 0 condition as integer (1 if t > 0, 0 if t == 0)
+    # Boolean math instead of tl.where
     has_prev_int = (t > 0).to(tl.int64)
-    
-    # Calculate previous row offset safely
-    # If t=0, has_prev_int=0, so prev_pid = pid (safe load of current token)
-    # If t>0, has_prev_int=1, so prev_pid = pid - 1 (load previous token)
-    prev_pid = pid - has_prev_int
-    prev_row = prev_pid * D * 2
+    prev_pid     = pid - has_prev_int
+    prev_row     = prev_pid * D * 2
 
     # Load current token
     cur_r = tl.load(x_states_ptr + row + d_off * 2,     mask=mask, other=0.0)
@@ -50,11 +46,10 @@ def _phase_rotation_kernel(
     rot_r = prev_r * cos_p - prev_i * sin_p
     rot_i = prev_r * sin_p + prev_i * cos_p
 
-    # Final result: combine using the integer flag
-    # If has_prev_int=1: rot_r
-    # If has_prev_int=0: cur_r
-    out_r = has_prev_int.to(tl.float32) * rot_r + (1.0 - has_prev_int.to(tl.float32)) * cur_r
-    out_i = has_prev_int.to(tl.float32) * rot_i + (1.0 - has_prev_int.to(tl.float32)) * cur_i
+    # Combine using float-converted boolean math
+    is_p = has_prev_int.to(tl.float32)
+    out_r = is_p * rot_r + (1.0 - is_p) * cur_r
+    out_i = is_p * rot_i + (1.0 - is_p) * cur_i
 
     tl.store(x_target_ptr + row + d_off * 2,     out_r, mask=mask)
     tl.store(x_target_ptr + row + d_off * 2 + 1, out_i, mask=mask)
@@ -65,10 +60,10 @@ def fused_phase_rotation(x_states, cos_p, sin_p):
     x_target    = torch.empty_like(x_states)
     BLOCK_D     = triton.next_power_of_2(D)
     _phase_rotation_kernel[(B * T,)](
-        x_states.contiguous().data_ptr(), 
-        cos_p.contiguous().data_ptr(), 
-        sin_p.contiguous().data_ptr(), 
-        x_target.data_ptr(),
+        x_states.contiguous(), 
+        cos_p.contiguous(), 
+        sin_p.contiguous(), 
+        x_target,
         T=T, D=D, BLOCK_D=BLOCK_D,
     )
     return x_target
@@ -96,10 +91,8 @@ def _ocns_delay_kernel(
     acc_r = tl.load(x_states_ptr + row + d_off * 2,     mask=mask, other=0.0)
     acc_i = tl.load(x_states_ptr + row + d_off * 2 + 1, mask=mask, other=0.0)
 
-    # We unroll the loop manually to avoid constexpr tuple indexing issues in 3.6
     for idx in tl.static_range(8):
         if idx < num_delays:
-            # Map idx to constexpr tau
             if idx == 0: tau = tau0
             elif idx == 1: tau = tau1
             elif idx == 2: tau = tau2
@@ -113,18 +106,15 @@ def _ocns_delay_kernel(
             valid_int = (t >= tau).to(tl.int64)
             src_pid   = pid - (valid_int * tau) 
             hist_row  = src_pid * D * 2
-            
-            # Mask out loads for invalid history tokens
             hist_mask = mask & (valid_int > 0)
 
             dr = tl.load(x_states_ptr + hist_row + d_off * 2,     mask=hist_mask, other=0.0)
             di = tl.load(x_states_ptr + hist_row + d_off * 2 + 1, mask=hist_mask, other=0.0)
 
-            gain_base = (idx * D * 2)
+            gain_base = idx * D * 2
             gr = tl.load(delay_gains_ptr + gain_base + d_off * 2,     mask=mask, other=0.0)
-            gi = tl.load(delay_gains_ptr + gain_base + d_off * 2 + 1, mask=mask, other=0.0)
+            gi = tl.load(delay_gains_ptr + delay_gains_ptr + gain_base + d_off * 2 + 1, mask=mask, other=0.0)
 
-            # Accumulate (multiplied by valid_int to be extra safe)
             acc_r += (dr * gr - di * gi) * valid_int.to(tl.float32)
             acc_i += (dr * gi + di * gr) * valid_int.to(tl.float32)
 
@@ -138,9 +128,9 @@ def fused_ocns_delay(x_states, delay_gains, prime_delays):
     padded  = list(prime_delays) + [0] * (8 - len(prime_delays))
     BLOCK_D = triton.next_power_of_2(D)
     _ocns_delay_kernel[(B * T,)](
-        x_states.contiguous().data_ptr(), 
-        delay_gains.contiguous().data_ptr(), 
-        x_eff.data_ptr(),
+        x_states.contiguous(), 
+        delay_gains.contiguous(), 
+        x_eff,
         tau0=padded[0], tau1=padded[1], tau2=padded[2], tau3=padded[3],
         tau4=padded[4], tau5=padded[5], tau6=padded[6], tau7=padded[7],
         num_delays=len(prime_delays),
@@ -166,7 +156,6 @@ def _state_update_kernel(
     x = tl.load(x_states_ptr + off, mask=mask, other=0.0)
     s = tl.load(step_ptr      + off, mask=mask, other=0.0)
 
-    # Fused clamp + scaled add
     s_clamped = tl.minimum(tl.maximum(s, -10.0), 10.0)
     tl.store(x_states_ptr + off, x + lr * s_clamped, mask=mask)
 
@@ -176,8 +165,8 @@ def fused_state_update(x_states, step, current_lr):
     BLOCK = 1024
     grid  = ((numel + BLOCK - 1) // BLOCK,)
     _state_update_kernel[grid](
-        x_states.contiguous().data_ptr(), 
-        step.contiguous().data_ptr(),
+        x_states.contiguous(), 
+        step.contiguous(),
         lr=float(current_lr), numel=numel, BLOCK=BLOCK,
     )
 
@@ -195,16 +184,15 @@ def _normalize_activate_kernel(
     mask  = d_off < D
     row   = pid * D * 2
 
-    count_val = tl.load(counts_ptr + pid)
-    count = tl.maximum(count_val, 1.0)
+    count = tl.load(counts_ptr + pid)
+    count = tl.maximum(count, 1.0)
 
     r = tl.load(output_ptr + row + d_off * 2,     mask=mask, other=0.0) / count
     i = tl.load(output_ptr + row + d_off * 2 + 1, mask=mask, other=0.0) / count
 
-    # ModReLU: ReLU(|z| + bias) * (z / max(|z|, eps))
-    mag          = tl.sqrt(r * r + i * i)
-    safe_mag     = tl.maximum(mag, 1e-8)
-    bias         = tl.load(bias_ptr + d_off, mask=mask, other=0.0)
+    mag           = tl.sqrt(r * r + i * i)
+    safe_mag      = tl.maximum(mag, 1e-8)
+    bias          = tl.load(bias_ptr + d_off, mask=mask, other=0.0)
     activated_mag = tl.maximum(mag + bias, 0.0)
 
     tl.store(result_ptr + row + d_off * 2,     (r / safe_mag) * activated_mag, mask=mask)
@@ -216,10 +204,10 @@ def fused_normalize_activate(output, counts, bias):
     result  = torch.empty_like(output)
     BLOCK_D = triton.next_power_of_2(D)
     _normalize_activate_kernel[(B_T,)](
-        output.contiguous().data_ptr(), 
-        counts.contiguous().data_ptr(), 
-        bias.contiguous().data_ptr(), 
-        result.data_ptr(),
+        output.contiguous(), 
+        counts.contiguous().view(-1), 
+        bias.contiguous(), 
+        result,
         B_T=B_T, D=D, BLOCK_D=BLOCK_D,
     )
     return result
