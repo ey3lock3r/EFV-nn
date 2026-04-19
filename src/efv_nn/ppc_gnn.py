@@ -182,8 +182,8 @@ class PPCNodeLayer(nn.Module):
 
                     current_lr *= self.lr_decay
 
-                    # --- Adaptive Phasal Depth: Early Exit (Check every step for High-Frequency Audit) ---
-                    if (i + 1) >= self.min_iters:
+                    # --- Adaptive Phasal Depth: Early Exit (Check every 8 iters for speed) ---
+                    if (i + 1) >= self.min_iters and (i + 1) % 8 == 0:
                         # Optimization: Use Max Token Error instead of Global Mean to avoid dilution.
                         token_res_sq = torch.mean(residual * residual, dim=(-2, -1)) * 2 # [B, T]
                         res_sq = torch.max(token_res_sq)
