@@ -63,6 +63,15 @@ class PPCNodeLayer(nn.Module):
         self._triton_available = TRITON_AVAILABLE and use_triton and torch.cuda.is_available()
 
         self.moe = ExpertChoiceMoEMatcher(hidden_dim, num_experts)
+        # Pillar 5: Selective Compilation. Compile the MoE to fuse its small sub-kernels.
+        # This is safe because MoE is pure PyTorch; the Triton loop remains external.
+        if self._triton_available:
+            self.moe = torch.compile(self.moe, mode="reduce-overhead")
+
+        # Persistent Buffers (avoiding allocation churn)
+        self._target_buf = None
+        self._eff_buf    = None
+        self._final_buf  = None
         
     def _apply_ocns_delays(self, x_states):
         """Memory-Efficient Phasal Delay Embedding (OCNS)."""
@@ -108,14 +117,21 @@ class PPCNodeLayer(nn.Module):
 
             # 1. Local Convergence (Frozen fixed point search)
             with torch.no_grad():
-                # Force to float32 and ensure it's on the same device as the layer weights
                 device = self.cos_p.device
                 x_states = x_stream.clone().detach().float().to(device)
+
+                # Buffer Management: Pre-allocate or reuse
+                if self._triton_available:
+                    if self._target_buf is None or self._target_buf.shape != x_states.shape:
+                        self._target_buf = torch.empty_like(x_states)
+                        self._eff_buf    = torch.empty_like(x_states)
+                        # We use 3-dim shape for final buffer as per activation kernel
+                        self._final_buf  = torch.empty(B*T, D, 2, device=device)
 
                 # --- Phase Rotation + Target Construction ---
                 if self._triton_available:
                     x_target_frozen = fused_phase_rotation(
-                        x_states, self.cos_p, self.sin_p
+                        x_states, self.cos_p, self.sin_p, out=self._target_buf
                     )
                 else:
                     x_prev = x_states[:, :-1, :, :]
@@ -138,7 +154,7 @@ class PPCNodeLayer(nn.Module):
                     # --- OCNS INJECTION POINT 1 ---
                     if self._triton_available and self.prime_delays:
                         x_eff = fused_ocns_delay(
-                            x_states, self.delay_gains, self.prime_delays
+                            x_states, self.delay_gains, self.prime_delays, out=self._eff_buf
                         )
                     else:
                         x_eff = self._apply_ocns_delays(x_states)
@@ -175,6 +191,15 @@ class PPCNodeLayer(nn.Module):
                         if torch.isnan(res_sq):
                             # Poisoning detected, but we keep thinking to see if Spectral Guardian can heal it
                             pass
+
+                # --- Final Normalize + Activate ---
+                # This step is critical for phasal resonance stability.
+                if self._triton_available:
+                    x_states = fused_normalize_activate(
+                        prediction, counts, self.moe.expert_bias, out=self._final_buf
+                    ).reshape(B, T, D, 2)
+                else:
+                    x_states = self._normalize_activate(prediction, counts)
             
             # 2. DEQ Gradient Attachment
             # Everything here stays in float32 for the analytical bridge
