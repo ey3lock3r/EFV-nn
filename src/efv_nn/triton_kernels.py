@@ -1,10 +1,9 @@
 """
-Triton Kernels for PPC-GNN (Triton 3.6.0 - Ironclad Edition).
+Triton Kernels for PPC-GNN (Triton 3.6.0 - Final In-Place Edition).
 
-Changes:
-  - Forced FP32: Python wrappers now explicitly cast to .float() for stability.
-  - Safe Normalize: Added check for magnitude overflow to prevent NaN.
-  - No 0*inf: Strict tl.where masking for OCNS delays.
+Fix:
+  - Removed .float() from wrappers to allow in-place updates.
+  - Calling code (ppc_gnn.py) now ensures tensors are FP32 before calling.
 """
 
 import torch
@@ -58,10 +57,10 @@ def fused_phase_rotation(x_states, cos_p, sin_p):
     x_target    = torch.empty_like(x_states)
     BLOCK_D     = triton.next_power_of_2(D)
     _phase_rotation_kernel[(B * T,)](
-        x_states.float().contiguous(), 
-        cos_p.float().contiguous(), 
-        sin_p.float().contiguous(), 
-        x_target.float(),
+        x_states.contiguous(), 
+        cos_p.contiguous(), 
+        sin_p.contiguous(), 
+        x_target,
         T=T, D=D, BLOCK_D=BLOCK_D,
     )
     return x_target
@@ -125,9 +124,9 @@ def fused_ocns_delay(x_states, delay_gains, prime_delays):
     padded  = list(prime_delays) + [0] * (8 - len(prime_delays))
     BLOCK_D = triton.next_power_of_2(D)
     _ocns_delay_kernel[(B * T,)](
-        x_states.float().contiguous(), 
-        delay_gains.float().contiguous(), 
-        x_eff.float(),
+        x_states.contiguous(), 
+        delay_gains.contiguous(), 
+        x_eff,
         tau0=padded[0], tau1=padded[1], tau2=padded[2], tau3=padded[3],
         tau4=padded[4], tau5=padded[5], tau6=padded[6], tau7=padded[7],
         num_delays=len(prime_delays),
@@ -162,8 +161,8 @@ def fused_state_update(x_states, step, current_lr):
     BLOCK = 1024
     grid  = ((numel + BLOCK - 1) // BLOCK,)
     _state_update_kernel[grid](
-        x_states.float().contiguous(), 
-        step.float().contiguous(),
+        x_states.contiguous(), 
+        step.contiguous(),
         lr=float(current_lr), numel=numel, BLOCK=BLOCK,
     )
 
@@ -189,7 +188,7 @@ def _normalize_activate_kernel(
 
     # Safe Normalize: prevent inf/inf = NaN
     mag           = tl.sqrt(r * r + i * i)
-    is_inf        = (mag > 1e18) # practically inf for float32
+    is_inf        = (mag > 1e18) 
     safe_mag      = tl.where(tl.broadcast_to(is_inf, (BLOCK_D,)), 1.0, tl.maximum(mag, 1e-8))
     
     bias          = tl.load(bias_ptr + d_off, mask=mask, other=0.0)
@@ -204,10 +203,10 @@ def fused_normalize_activate(output, counts, bias):
     result  = torch.empty_like(output)
     BLOCK_D = triton.next_power_of_2(D)
     _normalize_activate_kernel[(B_T,)](
-        output.float().contiguous(), 
-        counts.float().contiguous().view(-1), 
-        bias.float().contiguous(), 
-        result.float(),
+        output.contiguous(), 
+        counts.contiguous().view(-1), 
+        bias.contiguous(), 
+        result,
         B_T=B_T, D=D, BLOCK_D=BLOCK_D,
     )
     return result

@@ -113,7 +113,8 @@ class PPCNodeLayer(nn.Module):
 
             # 1. Local Convergence (Frozen fixed point search)
             with torch.no_grad():
-                x_states = x_stream.clone().detach()
+                # Force to float32 for the iterative loop to ensure stability and Triton compatibility
+                x_states = x_stream.clone().detach().float()
 
                 # --- Phase Rotation + Target Construction ---
                 if self._triton_available:
