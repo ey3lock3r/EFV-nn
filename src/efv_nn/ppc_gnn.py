@@ -23,25 +23,51 @@ def spectral_guardian_penalty(layer_energies: torch.Tensor, lam: float = 0.01) -
 
 
 class PPCNodeLayer(nn.Module):
-    def __init__(self, hidden_dim, num_experts=4, local_lr=0.5, lr_decay=0.85, tolerance=1e-3, use_jacobian=False, prime_delays=(1, 2, 3, 5)):
+    def __init__(self, hidden_dim, num_experts=4, local_lr=0.5, lr_decay=0.85, tolerance=1e-3,
+                 use_jacobian=False, prime_delays=(1, 2, 3, 5), use_triton=True, min_iters=8):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.base_local_lr = max(0.0, min(0.99, local_lr))
         self.lr_decay = lr_decay
         self.tolerance = tolerance
         self.use_jacobian = use_jacobian
-        
+        self.min_iters = min_iters  # APD: hard floor, model can never learn to skip thinking
+
+        # Adaptive Phasal Depth (APD): Learnable exit threshold with hard floor guard.
+        # Initialized to a large value so all iterations run at first.
+        # The optimizer will discover the optimal threshold from data.
+        self.exit_threshold = nn.Parameter(torch.tensor(1e3))
+
         # OCNS Integration: Phasal Delay Embedding Gains
         self.prime_delays = list(prime_delays) if prime_delays else []
         if self.prime_delays:
             # Shape: [num_delays, hidden_dim, 2] - allows complex scaling and phase rotation
             self.delay_gains = nn.Parameter(torch.zeros(len(self.prime_delays), hidden_dim, 2))
-        
+
         # Phase rotation parameters: store as cos/sin for manual rotation
         phase = torch.rand(hidden_dim) * 2 * math.pi
         self.register_buffer('cos_p', torch.cos(phase))
         self.register_buffer('sin_p', torch.sin(phase))
-        
+
+        # Triton Dual-Path: attempt to import compiled kernels.
+        # Falls back to Python path silently on CPU or if Triton is unavailable.
+        self._triton_available = False
+        if use_triton and torch.cuda.is_available():
+            try:
+                from efv_nn.triton_kernels import (
+                    fused_phase_rotation,
+                    fused_ocns_delay,
+                    fused_state_update,
+                    fused_normalize_activate,
+                )
+                self._fused_phase_rotation = fused_phase_rotation
+                self._fused_ocns_delay = fused_ocns_delay
+                self._fused_state_update = fused_state_update
+                self._fused_normalize_activate = fused_normalize_activate
+                self._triton_available = True
+            except (ImportError, Exception):
+                pass  # Silent fallback to Python path
+
         self.moe = ExpertChoiceMoEMatcher(hidden_dim, num_experts)
         
     def _apply_ocns_delays(self, x_states):
@@ -85,45 +111,69 @@ class PPCNodeLayer(nn.Module):
         with torch.amp.autocast('cuda', enabled=False):
             B, T, D, _ = x_stream.shape
             iters_run = 0
-            
+
             # 1. Local Convergence (Frozen fixed point search)
             with torch.no_grad():
                 x_states = x_stream.clone().detach()
-                
-                # Rotation buffers are typically float32, math should preserve it
-                x_prev = x_states[:, :-1, :, :] # [B, T-1, D, 2]
-                prev_r, prev_i = x_prev[..., 0], x_prev[..., 1]
-                
-                rot_r = prev_r * self.cos_p - prev_i * self.sin_p
-                rot_i = prev_r * self.sin_p + prev_i * self.cos_p
-                rot_prev = torch.stack([rot_r, rot_i], dim=-1)
-                
-                x_target_frozen = torch.zeros_like(x_states, dtype=torch.float32)
-                x_target_frozen[:, 1:, :, :] = rot_prev
-                x_target_frozen[:, 0, :, :] = x_states[:, 0, :, :]
-                
-                # Fixed-length loop for peak fusion: 16 small fused steps > 5 synced steps
+
+                # --- Phase Rotation + Target Construction ---
+                if self._triton_available:
+                    x_target_frozen = self._fused_phase_rotation(
+                        x_states, self.cos_p, self.sin_p
+                    )
+                else:
+                    x_prev = x_states[:, :-1, :, :]
+                    prev_r, prev_i = x_prev[..., 0], x_prev[..., 1]
+                    rot_r = prev_r * self.cos_p - prev_i * self.sin_p
+                    rot_i = prev_r * self.sin_p + prev_i * self.cos_p
+                    rot_prev = torch.stack([rot_r, rot_i], dim=-1)
+                    x_target_frozen = torch.zeros_like(x_states, dtype=torch.float32)
+                    x_target_frozen[:, 1:, :, :] = rot_prev
+                    x_target_frozen[:, 0, :, :] = x_states[:, 0, :, :]
+
+                # APD: get exit threshold value (clamped to positive, honoring min_iters floor)
+                exit_thr = self.exit_threshold.item()
+
                 current_lr = self.base_local_lr
                 for i in range(local_iters):
                     iters_run += 1
-                    
+
                     # --- OCNS INJECTION POINT 1 ---
-                    x_eff = self._apply_ocns_delays(x_states)
-                    
-                    prediction, indices, scores, counts = self.moe(x_eff.reshape(B*T, D, 2), gate_bias=gate_bias)
+                    if self._triton_available and self.prime_delays:
+                        x_eff = self._fused_ocns_delay(
+                            x_states, self.delay_gains, self.prime_delays
+                        )
+                    else:
+                        x_eff = self._apply_ocns_delays(x_states)
+
+                    prediction, indices, scores, counts = self.moe(
+                        x_eff.reshape(B * T, D, 2), gate_bias=gate_bias
+                    )
                     prediction = prediction.float().reshape(B, T, D, 2)
                     residual = x_target_frozen - prediction
 
                     if self.use_jacobian:
                         step = self.moe.transpose_forward(
-                            residual.reshape(B*T, D, 2), indices, scores, counts
+                            residual.reshape(B * T, D, 2), indices, scores, counts
                         ).float().reshape(B, T, D, 2)
-                        # Safety Clamp: Prevent explosive updates in early random-weight phase
-                        x_states.add_(torch.clamp(step, -10.0, 10.0), alpha=current_lr)
+                        # --- State Update ---
+                        if self._triton_available:
+                            self._fused_state_update(x_states, step, current_lr)
+                        else:
+                            x_states.add_(torch.clamp(step, -10.0, 10.0), alpha=current_lr)
                     else:
-                        x_states.add_(torch.clamp(residual, -10.0, 10.0), alpha=current_lr)
-                        
+                        if self._triton_available:
+                            self._fused_state_update(x_states, residual, current_lr)
+                        else:
+                            x_states.add_(torch.clamp(residual, -10.0, 10.0), alpha=current_lr)
+
                     current_lr *= self.lr_decay
+
+                    # --- Adaptive Phasal Depth: Early Exit (after min_iters floor) ---
+                    if i + 1 >= self.min_iters:
+                        current_energy = torch.norm(residual).item()
+                        if current_energy < exit_thr:
+                            break
             
             # 2. DEQ Gradient Attachment
             # Everything here stays in float32 for the analytical bridge

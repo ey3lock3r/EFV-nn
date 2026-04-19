@@ -6,35 +6,42 @@ from efv_nn.ppc_gnn import PPCNodeLayer
 
 class ShardedPPCGraphLLM(nn.Module):
     def __init__(self, vocab_size: int, hidden_dim: int = 1024, num_layers: int = 24,
-                 num_experts: int = 64, local_lr: float = 0.5, lr_decay: float = 0.85, use_jacobian: bool = False, prime_delays=(1, 2, 3, 5)):
+                 num_experts: int = 64, local_lr: float = 0.5, lr_decay: float = 0.85,
+                 use_jacobian: bool = False, prime_delays=(1, 2, 3, 5), use_triton: bool = True):
         super().__init__()
         self.vocab_size = vocab_size
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
-        
+
         # GPU Assignment
         self.device0 = "cuda:0" if torch.cuda.is_available() else "cpu"
         self.device1 = "cuda:1" if torch.cuda.device_count() > 1 else self.device0
-        
+
         self.split_point = num_layers // 2
-        
+
         # 1. Sharded Embeddings (GPU 0) - stores interleaved real [V, D, 2]
         self.embedding = nn.Embedding(vocab_size, hidden_dim * 2).to(self.device0)
-        
+
         with torch.no_grad():
             from efv_nn.ppc_core import ComplexKaimingInitializer
             init_w = ComplexKaimingInitializer.initialize((vocab_size, hidden_dim))
             self.embedding.weight.copy_(init_w.reshape(vocab_size, hidden_dim * 2))
 
-        # 2. Sharded Layer Blocks (Independently Compiled Islands)
+        # 2. Sharded Layer Blocks
         self.layers = nn.ModuleList()
         for i in range(num_layers):
             target_device = self.device0 if i < self.split_point else self.device1
-            layer = PPCNodeLayer(hidden_dim, num_experts=num_experts, local_lr=local_lr, lr_decay=lr_decay, use_jacobian=use_jacobian, prime_delays=prime_delays).to(target_device)
-            
-            # Island Optimization: Compile each layer individually to avoid Multi-Device Graph Breaks
-            compiled_layer = torch.compile(layer, mode="reduce-overhead")
-            self.layers.append(compiled_layer)
+            layer = PPCNodeLayer(
+                hidden_dim, num_experts=num_experts, local_lr=local_lr,
+                lr_decay=lr_decay, use_jacobian=use_jacobian,
+                prime_delays=prime_delays, use_triton=use_triton
+            ).to(target_device)
+
+            # Triton kernels are pre-compiled on first call — no cold start needed.
+            # torch.compile is only applied as fallback when Triton is unavailable.
+            if not layer._triton_available:
+                layer = torch.compile(layer, mode="reduce-overhead")
+            self.layers.append(layer)
 
         # 3. Output Head (GPU 1)
         self.layer_norm = nn.LayerNorm(hidden_dim * 2).to(self.device1)
