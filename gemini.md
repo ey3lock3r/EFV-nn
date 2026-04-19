@@ -55,6 +55,12 @@
     - **Axiom: The Stale Reference Trap**: `from module import function` binds the function at import time. `importlib.reload(module)` will NOT update existing references in other modules. **Fix**: Always use `from package import module` and call `module.function()` to ensure reloads are globally effective.
     - **Axiom: The Shape Juggling Tax**: Mismatched dimensions between Model (4D) and Kernels (3D) lead to cascading `ValueError`. **Fix**: Standardize all Triton wrappers to accept native Model shapes (`[B, T, D, 2]`) and handle internal flattening/unflattening automatically.
     - **Axiom: CUDAGraphs Exorcism**: `torch.compile(mode="reduce-overhead")` forces CUDAGraphs, which assumes a static memory pool. Switching between `no_grad` (DEQ iterations) and `grad` (Gradient Bridge) corrupts this pool (`curr_block->next == nullptr` crash). **Fix**: Rely solely on custom Triton kernels and manual FP16 contiguity optimizations; avoid `torch.compile` in the loop.
+- **[2026-04-19] Phase 6 Hard Stabilization (The Native Pivot):**
+    -   **Axiom: Weight Cache (The 147GB Copy)**: Slicing interleaved real parameters `[..., 2]` inside a tight loop (48 iters) forces a `.contiguous()` allocation every single call. At 3.2B params, this moves **147 GB** per step. **Fix**: Implement `cache_weights()` outside the loop to pre-align FP16 views and eliminate allocation overhead.
+    -   **Axiom: APD Mathematics**: Early Exit logic using `torch.sum(residual**2)` is numerically unreachable due to sequence-length scaling. **Fix**: Use `torch.mean(residual**2) * 2` to align with the normalized `res_norm` metric, allowing early exit at iteration 8.
+    -   **Axiom: Atomic Move (The 20GB Ceiling)**: High-safety saves (`shutil.copy` + `.tmp`) consume 3x model size (22.5GB). **Fix**: Use `shutil.move` for atomic rotation to keep disk usage at 2x (15GB), fitting within Kaggle's 20GB limit.
+    -   **Axiom: Ghost-Blind Loading**: Checkpoints from compiled sessions contain `_orig_mod` prefixes. **Fix**: Use a dynamic state-dict mapper to strip prefixes during loading, ensuring native models can resume from compiled weights.
+    -   **Axiom: Ghost Persistence**: `importlib.reload` cannot flush classes hot-patched by Dynamo. A **Full Kernel Restart** is mandatory to clear stale optimized references from Python's RAM.
 - **[2026-04-15] Infrastructure & Diagnostic Stability:**
     - **Axiom: Hook Safety**: Mandatory `try/finally` for hooks on live models. Prevents OOM/Perf-leaks.
     - **Axiom: Timer Integrity**: Reset `t0` post-disk I/O (7.5GB saves) to stop metric inflation.
@@ -99,3 +105,10 @@
     - Move Experts to 4-bit NormalFloat (NF4) while keeping PPC core in FP32.
     - Target: Scale to 6.4B parameters on Dual-T4 hardware without OOM.
 
+### Phase 6: Hard Stabilization & Phasal Resonance (3.2B)
+- **Mistake: The "Frozen Target" Trap**: Initially, the phasal target was computed once before the DEQ loop. This allowed the model to "cheat" by hitting a static goal instantly.
+- **Fix: Moving Target Logic**: Moving target construction **INSIDE** the loop forced the model to chase a dynamic fixed point, finally unlocking the hidden semantic precision.
+- **Learning: Global Mean Dilution**: Using `mean(residual)` in APD allowed easy tokens (80%) to "cloak" hard tokens (20%).
+- **Fix: "Weakest Link" Policy**: Switching to `max(token_error)` ensures the model iterates until the **single hardest token** in the batch is satisfied.
+- **The Atomic Limit**: Found that `0.000005` (5 micro-resonance) is the Phase 6 "Sweet Spot." Tightening to `0.000001` leads to "Infinite Thinking" (48 iters) with diminishing returns.
+- **Live-Tune Protocol**: Implementing hyperparameter injection into training signatures allows for real-time precision tuning without kernel restarts.
