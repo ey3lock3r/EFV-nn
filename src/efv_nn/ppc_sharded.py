@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 import bitsandbytes.nn as bnb_nn
-from efv_nn.ppc_gnn import PPCNodeLayer
+from efv_nn import ppc_gnn, ppc_core
 
 class ShardedPPCGraphLLM(nn.Module):
     def __init__(self, vocab_size: int, hidden_dim: int = 1024, num_layers: int = 24,
@@ -23,15 +23,15 @@ class ShardedPPCGraphLLM(nn.Module):
         self.embedding = nn.Embedding(vocab_size, hidden_dim * 2).to(self.device0)
 
         with torch.no_grad():
-            from efv_nn.ppc_core import ComplexKaimingInitializer
-            init_w = ComplexKaimingInitializer.initialize((vocab_size, hidden_dim))
+            # Correctly initialise the interleaved real pair
+            init_w = ppc_core.ComplexKaimingInitializer.initialize((vocab_size, hidden_dim))
             self.embedding.weight.copy_(init_w.reshape(vocab_size, hidden_dim * 2))
 
         # 2. Sharded Layer Blocks
         self.layers = nn.ModuleList()
         for i in range(num_layers):
             target_device = self.device0 if i < self.split_point else self.device1
-            layer = PPCNodeLayer(
+            layer = ppc_gnn.PPCNodeLayer(
                 hidden_dim, num_experts=num_experts, local_lr=local_lr,
                 lr_decay=lr_decay, use_jacobian=use_jacobian,
                 prime_delays=prime_delays, use_triton=use_triton

@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import math
 import torch.nn.functional as F
-from efv_nn.ppc_core import ExpertChoiceMoEMatcher
+from efv_nn import ppc_core
 
 # Optimization: Import Triton kernels as module to allow dynamic reloads
 try:
@@ -59,7 +59,7 @@ class PPCNodeLayer(nn.Module):
         # Check for Triton availability (used in forward)
         self._triton_available = TRITON_AVAILABLE and use_triton and torch.cuda.is_available()
 
-        self.moe = ExpertChoiceMoEMatcher(hidden_dim, num_experts)
+        self.moe = ppc_core.ExpertChoiceMoEMatcher(hidden_dim, num_experts=num_experts)
         # Pillar 5: Selective Compilation. Compile the MoE to fuse its small sub-kernels.
         # This is safe because MoE is pure PyTorch; the Triton loop remains external.
         if self._triton_available:
@@ -240,9 +240,8 @@ class PPCGraphLLM(nn.Module):
         self.embedding = nn.Embedding(vocab_size, hidden_dim * 2)
         
         with torch.no_grad():
-            from efv_nn.ppc_core import ComplexKaimingInitializer
             # Correctly initialise the interleaved real pair
-            init_w = ComplexKaimingInitializer.initialize((vocab_size, hidden_dim))
+            init_w = ppc_core.ComplexKaimingInitializer.initialize((vocab_size, hidden_dim))
             self.embedding.weight.copy_(init_w.reshape(vocab_size, hidden_dim * 2))
 
         self.layers = nn.ModuleList([
