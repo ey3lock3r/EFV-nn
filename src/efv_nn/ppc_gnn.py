@@ -166,18 +166,14 @@ class PPCNodeLayer(nn.Module):
 
                     current_lr *= self.lr_decay
 
-                    # --- Adaptive Phasal Depth: Early Exit (after min_iters floor) ---
-                    if i + 1 >= self.min_iters:
+                    # --- Adaptive Phasal Depth: Early Exit (Check every 8 iters to avoid sync overhead) ---
+                    if (i + 1) >= self.min_iters and (i + 1) % 8 == 0:
                         # Optimization: Use squared norm to avoid sync and sqrt
-                        # item() is still needed for 'if', but by checking after min_iters
-                        # and using squared comparison, we minimize impact.
-                        # NaN check: if energy is NaN, we never break.
                         res_sq = torch.sum(residual * residual)
                         if res_sq.item() < exit_thr_sq:
                             break
                         if torch.isnan(res_sq):
                             # Poisoning detected, but we keep thinking to see if Spectral Guardian can heal it
-                            # (or at least avoid premature exit into a NaN loss)
                             pass
             
             # 2. DEQ Gradient Attachment
