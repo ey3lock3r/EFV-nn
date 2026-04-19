@@ -122,8 +122,7 @@ class PPCNodeLayer(nn.Module):
                     if self._target_buf is None or self._target_buf.shape != x_states.shape:
                         self._target_buf = torch.empty_like(x_states)
                         self._eff_buf    = torch.empty_like(x_states)
-                        # We use 3-dim shape for final buffer as per activation kernel
-                        self._final_buf  = torch.empty(B*T, D, 2, device=device)
+                        self._final_buf  = torch.empty_like(x_states)
 
                 # --- Phase Rotation + Target Construction ---
                 if self._triton_available:
@@ -194,7 +193,7 @@ class PPCNodeLayer(nn.Module):
                 if self._triton_available:
                     x_states = triton_kernels.fused_normalize_activate(
                         prediction, counts, self.moe.activation.bias, out=self._final_buf
-                    ).reshape(B, T, D, 2)
+                    )
                 else:
                     x_states = self._normalize_activate(prediction, counts)
             

@@ -52,10 +52,13 @@ def _phase_rotation_kernel(
 
 
 def fused_phase_rotation(x_states, cos_p, sin_p, out=None):
+    """Expects [B, T, D, 2]. Returns [B, T, D, 2]."""
     B, T, D, _ = x_states.shape
     if out is None:
         out = torch.empty_like(x_states)
+    
     BLOCK_D = triton.next_power_of_2(D)
+    # The kernel operates on flat (B*T) rows
     _phase_rotation_kernel[(B * T,)](
         x_states.contiguous(), 
         cos_p.contiguous(), 
@@ -119,9 +122,11 @@ def _ocns_delay_kernel(
 
 
 def fused_ocns_delay(x_states, delay_gains, prime_delays, out=None):
+    """Expects [B, T, D, 2]. Returns [B, T, D, 2]."""
     B, T, D, _ = x_states.shape
     if out is None:
         out = torch.empty_like(x_states)
+    
     padded  = list(prime_delays) + [0] * (8 - len(prime_delays))
     BLOCK_D = triton.next_power_of_2(D)
     _ocns_delay_kernel[(B * T,)](
@@ -160,6 +165,7 @@ def _state_update_kernel(
 
 
 def fused_state_update(x_states, step, current_lr):
+    """In-place update. Accepts any shape as long as it is contiguous."""
     assert x_states.is_contiguous(), "State update must be in-place on contiguous tensor"
     numel = x_states.numel()
     BLOCK = 1024
@@ -203,9 +209,17 @@ def _normalize_activate_kernel(
 
 
 def fused_normalize_activate(output, counts, bias, out=None):
-    B_T, D, _ = output.shape
+    """Expects [B, T, D, 2] or [B_T, D, 2]. Returns same shape as input."""
+    # Detect shape and normalize to B_T
+    if output.dim() == 4:
+        B, T, D, _ = output.shape
+        B_T = B * T
+    else:
+        B_T, D, _ = output.shape
+
     if out is None:
         out = torch.empty_like(output)
+    
     BLOCK_D = triton.next_power_of_2(D)
     _normalize_activate_kernel[(B_T,)](
         output.contiguous(), 
