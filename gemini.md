@@ -39,6 +39,12 @@
 ---
 
 ## 4. Learnings & Mistakes Diary (High-Density)
+- **[2026-04-18] The 20,000-Step Milestone (Phase 6):**
+    - **Axiom: Syntactic Mastery**: At 10M tokens (Step 20k), 3.2B PPC-GNN achieves perfect syntax (punctuation/preposition clustering) without semantic coherence. Loss floor breached at `7.39`.
+    - **Axiom: Phasal Annealing**: To break the final 7.5 plateau, LR must drop to micro-scale (`1e-6`) to force gradients out of the "wandering valley" and into absolute factual minima.
+    - **Axiom: OCNS Memory Hygiene**: `torch.roll` inside iterative loops (48 iters) triggers OOM via activation-buffer explosion. **Fix**: Use zero-copy Slicing (Views) for temporal shifts to maintain dual-T4 feasibility.
+    - **Axiom: Triton Dual-Path**: Fuse elementwise ops (phase rotation, OCNS delay, state update, normalize+activate) into Triton kernels. Use Python path as fallback + ground truth. Eliminates `torch.compile` cold-start entirely.
+    - **Axiom: APD Floor**: Adaptive Phasal Depth uses learnable `exit_threshold` with mandatory `min_iters=8` floor. Initialized large (1e3) so full iterations run at first. Avoids graph break via threshold check in no_grad loop only.
 - **[2026-04-15] Infrastructure & Diagnostic Stability:**
     - **Axiom: Hook Safety**: Mandatory `try/finally` for hooks on live models. Prevents OOM/Perf-leaks.
     - **Axiom: Timer Integrity**: Reset `t0` post-disk I/O (7.5GB saves) to stop metric inflation.
@@ -69,4 +75,17 @@
     - **Axiom: Delay Embedding**: Implemented 4-tap Prime delay `[1, 2, 3, 5]` in `PPCNodeLayer`.
     - **Axiom: Phasal Resonance**: Used Complex multiplication for delay gains. Spectral Guardian mitigates Energy Drift.
     - **Axiom: Zero-Impact Injection**: Initialized `delay_gains` to `0.0`. Resumes existing 3.2B runs safely via `strict=False`.
+
+---
+
+## 5. Scaling & Optimization Roadmap
+- **Adaptive Phasal Depth (APD)**: 
+    - Implement Energy-based Early Exit. Tokens with $E < \epsilon$ exit the loop early.
+    - Target: 3x-5x speedup in inference/training throughput.
+- **Triton Kernel Fusion**:
+    - Rewrite `PPCNodeLayer` iterative loop in raw Triton. 
+    - Target: Eliminate `torch.compile` cold-start latency and fuse MoE/OCNS into a single SRAM kernel.
+- **NF4 Quantized Experts**:
+    - Move Experts to 4-bit NormalFloat (NF4) while keeping PPC core in FP32.
+    - Target: Scale to 6.4B parameters on Dual-T4 hardware without OOM.
 
