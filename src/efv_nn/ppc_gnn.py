@@ -4,12 +4,9 @@ import math
 import torch.nn.functional as F
 from efv_nn.ppc_core import ExpertChoiceMoEMatcher
 
-# Optimization: Import Triton kernels at module level to avoid loop overhead
+# Optimization: Import Triton kernels as module to allow dynamic reloads
 try:
-    from efv_nn.triton_kernels import (
-        fused_phase_rotation, fused_ocns_delay, 
-        fused_state_update, fused_normalize_activate
-    )
+    from efv_nn import triton_kernels
     TRITON_AVAILABLE = True
 except (ImportError, Exception):
     TRITON_AVAILABLE = False
@@ -130,7 +127,7 @@ class PPCNodeLayer(nn.Module):
 
                 # --- Phase Rotation + Target Construction ---
                 if self._triton_available:
-                    x_target_frozen = fused_phase_rotation(
+                    x_target_frozen = triton_kernels.fused_phase_rotation(
                         x_states, self.cos_p, self.sin_p, out=self._target_buf
                     )
                 else:
@@ -153,7 +150,7 @@ class PPCNodeLayer(nn.Module):
 
                     # --- OCNS INJECTION POINT 1 ---
                     if self._triton_available and self.prime_delays:
-                        x_eff = fused_ocns_delay(
+                        x_eff = triton_kernels.fused_ocns_delay(
                             x_states, self.delay_gains, self.prime_delays, out=self._eff_buf
                         )
                     else:
@@ -171,12 +168,12 @@ class PPCNodeLayer(nn.Module):
                         ).float().reshape(B, T, D, 2)
                         # --- State Update ---
                         if self._triton_available:
-                            fused_state_update(x_states, step, current_lr)
+                            triton_kernels.fused_state_update(x_states, step, current_lr)
                         else:
                             x_states.add_(torch.clamp(step, -10.0, 10.0), alpha=current_lr)
                     else:
                         if self._triton_available:
-                            fused_state_update(x_states, residual, current_lr)
+                            triton_kernels.fused_state_update(x_states, residual, current_lr)
                         else:
                             x_states.add_(torch.clamp(residual, -10.0, 10.0), alpha=current_lr)
 
@@ -195,7 +192,7 @@ class PPCNodeLayer(nn.Module):
                 # --- Final Normalize + Activate ---
                 # This step is critical for phasal resonance stability.
                 if self._triton_available:
-                    x_states = fused_normalize_activate(
+                    x_states = triton_kernels.fused_normalize_activate(
                         prediction, counts, self.moe.expert_bias, out=self._final_buf
                     ).reshape(B, T, D, 2)
                 else:
