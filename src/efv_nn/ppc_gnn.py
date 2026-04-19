@@ -112,8 +112,13 @@ class PPCNodeLayer(nn.Module):
                 if torch.isnan(x_stream).any():
                     print("⚠️ WARNING: Input x_stream contains NaNs!")
                 
-                # Force to float32 for the iterative loop to ensure stability and Triton compatibility
-                x_states = x_stream.clone().detach().float()
+                # Force to float32 and ensure it's on the same device as the layer weights
+                # This fixes the "cpu tensor?" error during resumption.
+                device = self.cos_p.device
+                x_states = x_stream.clone().detach().float().to(device)
+                
+                if x_states.device.type == 'cpu':
+                    print(f"⚠️ CRITICAL: x_states is on CPU! Layer device: {device}")
 
                 # --- Phase Rotation + Target Construction ---
                 if self._triton_available:

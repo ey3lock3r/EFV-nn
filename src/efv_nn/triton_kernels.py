@@ -1,10 +1,9 @@
 """
-Triton Kernels for PPC-GNN (Triton 3.6.0 - Deep Stability Edition).
+Triton Kernels for PPC-GNN (Triton 3.6.0 - Multi-GPU Edition).
 
-Safety Reinforcements:
-  - In-place Contiguity: Added assertions to ensure in-place updates never hit a copy.
-  - NaN-Siphon: State updates now explicitly discard NaN steps (set to 0).
-  - NaN-Proof Normalize: Activation kernel now handles both inf and nan safely.
+Fixes:
+  - Added torch.cuda.device() context to all wrappers.
+  - Ensures kernels launch on the correct GPU in Dual-T4 setups.
 """
 
 import torch
@@ -55,16 +54,18 @@ def _phase_rotation_kernel(
 
 def fused_phase_rotation(x_states, cos_p, sin_p):
     B, T, D, _ = x_states.shape
-    x_target    = torch.empty_like(x_states)
-    BLOCK_D     = triton.next_power_of_2(D)
-    _phase_rotation_kernel[(B * T,)](
-        x_states.contiguous(), 
-        cos_p.contiguous(), 
-        sin_p.contiguous(), 
-        x_target,
-        T=T, D=D, BLOCK_D=BLOCK_D,
-    )
-    return x_target
+    device      = x_states.device
+    with torch.cuda.device(device):
+        x_target    = torch.empty_like(x_states)
+        BLOCK_D     = triton.next_power_of_2(D)
+        _phase_rotation_kernel[(B * T,)](
+            x_states.contiguous(), 
+            cos_p.contiguous(), 
+            sin_p.contiguous(), 
+            x_target,
+            T=T, D=D, BLOCK_D=BLOCK_D,
+        )
+        return x_target
 
 
 # ============================================================
@@ -121,19 +122,21 @@ def _ocns_delay_kernel(
 
 def fused_ocns_delay(x_states, delay_gains, prime_delays):
     B, T, D, _ = x_states.shape
-    x_eff   = torch.empty_like(x_states)
-    padded  = list(prime_delays) + [0] * (8 - len(prime_delays))
-    BLOCK_D = triton.next_power_of_2(D)
-    _ocns_delay_kernel[(B * T,)](
-        x_states.contiguous(), 
-        delay_gains.contiguous(), 
-        x_eff,
-        tau0=padded[0], tau1=padded[1], tau2=padded[2], tau3=padded[3],
-        tau4=padded[4], tau5=padded[5], tau6=padded[6], tau7=padded[7],
-        num_delays=len(prime_delays),
-        T=T, D=D, BLOCK_D=BLOCK_D,
-    )
-    return x_eff
+    device      = x_states.device
+    with torch.cuda.device(device):
+        x_eff   = torch.empty_like(x_states)
+        padded  = list(prime_delays) + [0] * (8 - len(prime_delays))
+        BLOCK_D = triton.next_power_of_2(D)
+        _ocns_delay_kernel[(B * T,)](
+            x_states.contiguous(), 
+            delay_gains.contiguous(), 
+            x_eff,
+            tau0=padded[0], tau1=padded[1], tau2=padded[2], tau3=padded[3],
+            tau4=padded[4], tau5=padded[5], tau6=padded[6], tau7=padded[7],
+            num_delays=len(prime_delays),
+            T=T, D=D, BLOCK_D=BLOCK_D,
+        )
+        return x_eff
 
 
 # ============================================================
@@ -154,7 +157,6 @@ def _state_update_kernel(
     s = tl.load(step_ptr      + off, mask=mask, other=0.0)
 
     # NaN Protection: Set NaN steps to 0 (Siphon effect)
-    # Using (s != s) trick because Triton 3.6.0 lacks tl.isnan
     s = tl.where(s != s, 0.0, s)
 
     s_clamped = tl.minimum(tl.maximum(s, -10.0), 10.0)
@@ -164,14 +166,16 @@ def _state_update_kernel(
 def fused_state_update(x_states, step, current_lr):
     # CRITICAL: Assertion to prevent copy-bug regression
     assert x_states.is_contiguous(), "State update must be in-place on contiguous tensor"
-    numel = x_states.numel()
-    BLOCK = 1024
-    grid  = ((numel + BLOCK - 1) // BLOCK,)
-    _state_update_kernel[grid](
-        x_states, # Pass directly for in-place
-        step.contiguous(),
-        lr=float(current_lr), numel=numel, BLOCK=BLOCK,
-    )
+    device = x_states.device
+    with torch.cuda.device(device):
+        numel = x_states.numel()
+        BLOCK = 1024
+        grid  = ((numel + BLOCK - 1) // BLOCK,)
+        _state_update_kernel[grid](
+            x_states, 
+            step.contiguous(),
+            lr=float(current_lr), numel=numel, BLOCK=BLOCK,
+        )
 
 
 # ============================================================
@@ -194,7 +198,6 @@ def _normalize_activate_kernel(
     i = tl.load(output_ptr + row + d_off * 2 + 1, mask=mask, other=0.0) / count
 
     # Safe Normalize: prevent inf/nan poisoning
-    # Using (mag != mag) trick because Triton 3.6.0 lacks tl.isnan
     mag    = tl.sqrt(r * r + i * i)
     is_bad = (mag > 1e18) | (mag != mag)
     
@@ -211,13 +214,15 @@ def _normalize_activate_kernel(
 
 def fused_normalize_activate(output, counts, bias):
     B_T, D, _ = output.shape
-    result  = torch.empty_like(output)
-    BLOCK_D = triton.next_power_of_2(D)
-    _normalize_activate_kernel[(B_T,)](
-        output.contiguous(), 
-        counts.contiguous().view(-1), 
-        bias.contiguous(), 
-        result,
-        B_T=B_T, D=D, BLOCK_D=BLOCK_D,
-    )
-    return result
+    device     = output.device
+    with torch.cuda.device(device):
+        result  = torch.empty_like(output)
+        BLOCK_D = triton.next_power_of_2(D)
+        _normalize_activate_kernel[(B_T,)](
+            output.contiguous(), 
+            counts.contiguous().view(-1), 
+            bias.contiguous(), 
+            result,
+            B_T=B_T, D=D, BLOCK_D=BLOCK_D,
+        )
+        return result
