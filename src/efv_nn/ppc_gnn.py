@@ -132,7 +132,8 @@ class PPCNodeLayer(nn.Module):
                     x_target_frozen[:, 0, :, :] = x_states[:, 0, :, :]
 
                 # APD: get exit threshold value (clamped to positive, honoring min_iters floor)
-                exit_thr = self.exit_threshold.item()
+                # We use squared threshold to avoid sqrt on GPU
+                exit_thr_sq = self.exit_threshold.item() ** 2
 
                 current_lr = self.base_local_lr
                 for i in range(local_iters):
@@ -171,9 +172,17 @@ class PPCNodeLayer(nn.Module):
 
                     # --- Adaptive Phasal Depth: Early Exit (after min_iters floor) ---
                     if i + 1 >= self.min_iters:
-                        current_energy = torch.norm(residual).item()
-                        if current_energy < exit_thr:
+                        # Optimization: Use squared norm to avoid sync and sqrt
+                        # item() is still needed for 'if', but by checking after min_iters
+                        # and using squared comparison, we minimize impact.
+                        # NaN check: if energy is NaN, we never break.
+                        res_sq = torch.sum(residual * residual)
+                        if res_sq.item() < exit_thr_sq:
                             break
+                        if torch.isnan(res_sq):
+                            # Poisoning detected, but we keep thinking to see if Spectral Guardian can heal it
+                            # (or at least avoid premature exit into a NaN loss)
+                            pass
             
             # 2. DEQ Gradient Attachment
             # Everything here stays in float32 for the analytical bridge
