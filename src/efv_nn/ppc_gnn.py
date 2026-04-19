@@ -193,7 +193,7 @@ class PPCNodeLayer(nn.Module):
                 # This step is critical for phasal resonance stability.
                 if self._triton_available:
                     x_states = triton_kernels.fused_normalize_activate(
-                        prediction, counts, self.moe.expert_bias, out=self._final_buf
+                        prediction, counts, self.moe.activation.bias, out=self._final_buf
                     ).reshape(B, T, D, 2)
                 else:
                     x_states = self._normalize_activate(prediction, counts)
