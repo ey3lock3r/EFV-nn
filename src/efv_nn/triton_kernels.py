@@ -154,7 +154,8 @@ def _state_update_kernel(
     s = tl.load(step_ptr      + off, mask=mask, other=0.0)
 
     # NaN Protection: Set NaN steps to 0 (Siphon effect)
-    s = tl.where(tl.isnan(s), 0.0, s)
+    # Using (s != s) trick because Triton 3.6.0 lacks tl.isnan
+    s = tl.where(s != s, 0.0, s)
 
     s_clamped = tl.minimum(tl.maximum(s, -10.0), 10.0)
     tl.store(x_states_ptr + off, x + lr * s_clamped, mask=mask)
@@ -193,8 +194,9 @@ def _normalize_activate_kernel(
     i = tl.load(output_ptr + row + d_off * 2 + 1, mask=mask, other=0.0) / count
 
     # Safe Normalize: prevent inf/nan poisoning
+    # Using (mag != mag) trick because Triton 3.6.0 lacks tl.isnan
     mag    = tl.sqrt(r * r + i * i)
-    is_bad = (mag > 1e18) | tl.isnan(mag)
+    is_bad = (mag > 1e18) | (mag != mag)
     
     # Broadcast condition
     bad_mask = tl.broadcast_to(is_bad, (BLOCK_D,))
