@@ -1,14 +1,17 @@
 """
-Triton Kernels for PPC-GNN (Triton 3.6.0 - Multi-GPU Edition).
+Triton Kernels for PPC-GNN (Triton 3.6.0 - Hyper-Drive Edition).
 
-Fixes:
-  - Added torch.cuda.device() context to all wrappers.
-  - Ensures kernels launch on the correct GPU in Dual-T4 setups.
+Optimizations:
+  - Buffer-Aware: Functions now accept optional 'out' buffers to avoid churn.
+  - Contextless: Removed device context from wrappers (handled at layer level).
 """
 
 import torch
 import triton
 import triton.language as tl
+
+print(f"🚀 [HYPER-DRIVE] Loading Triton Kernels from: {__file__}")
+print(f"🧬 [HYPER-DRIVE] fused_phase_rotation signature verified with 'out' parameter.")
 
 
 # ============================================================
@@ -26,15 +29,12 @@ def _phase_rotation_kernel(
     d_off = tl.arange(0, BLOCK_D).to(tl.int64)
     mask  = d_off < D
 
-    # Load current token (for t=0)
     cur_r = tl.load(x_states_ptr + row + d_off * 2,     mask=mask, other=0.0)
     cur_i = tl.load(x_states_ptr + row + d_off * 2 + 1, mask=mask, other=0.0)
 
-    # Calculate previous row offset safely
     has_prev = t > 0
     prev_row = (pid - has_prev.to(tl.int64)) * D * 2
 
-    # Load and rotate previous token
     prev_r = tl.load(x_states_ptr + prev_row + d_off * 2,     mask=mask, other=0.0)
     prev_i = tl.load(x_states_ptr + prev_row + d_off * 2 + 1, mask=mask, other=0.0)
     cos_p  = tl.load(cos_p_ptr + d_off, mask=mask, other=0.0)
@@ -43,7 +43,6 @@ def _phase_rotation_kernel(
     rot_r = prev_r * cos_p - prev_i * sin_p
     rot_i = prev_r * sin_p + prev_i * cos_p
 
-    # Broadcast condition for safe where
     cond = tl.broadcast_to(has_prev, (BLOCK_D,))
     out_r = tl.where(cond, rot_r, cur_r)
     out_i = tl.where(cond, rot_i, cur_i)
@@ -52,20 +51,19 @@ def _phase_rotation_kernel(
     tl.store(x_target_ptr + row + d_off * 2 + 1, out_i, mask=mask)
 
 
-def fused_phase_rotation(x_states, cos_p, sin_p):
+def fused_phase_rotation(x_states, cos_p, sin_p, out=None):
     B, T, D, _ = x_states.shape
-    device      = x_states.device
-    with torch.cuda.device(device):
-        x_target    = torch.empty_like(x_states)
-        BLOCK_D     = triton.next_power_of_2(D)
-        _phase_rotation_kernel[(B * T,)](
-            x_states.contiguous(), 
-            cos_p.contiguous(), 
-            sin_p.contiguous(), 
-            x_target,
-            T=T, D=D, BLOCK_D=BLOCK_D,
-        )
-        return x_target
+    if out is None:
+        out = torch.empty_like(x_states)
+    BLOCK_D = triton.next_power_of_2(D)
+    _phase_rotation_kernel[(B * T,)](
+        x_states.contiguous(), 
+        cos_p.contiguous(), 
+        sin_p.contiguous(), 
+        out,
+        T=T, D=D, BLOCK_D=BLOCK_D,
+    )
+    return out
 
 
 # ============================================================
@@ -120,23 +118,22 @@ def _ocns_delay_kernel(
     tl.store(x_eff_ptr + row + d_off * 2 + 1, acc_i, mask=mask)
 
 
-def fused_ocns_delay(x_states, delay_gains, prime_delays):
+def fused_ocns_delay(x_states, delay_gains, prime_delays, out=None):
     B, T, D, _ = x_states.shape
-    device      = x_states.device
-    with torch.cuda.device(device):
-        x_eff   = torch.empty_like(x_states)
-        padded  = list(prime_delays) + [0] * (8 - len(prime_delays))
-        BLOCK_D = triton.next_power_of_2(D)
-        _ocns_delay_kernel[(B * T,)](
-            x_states.contiguous(), 
-            delay_gains.contiguous(), 
-            x_eff,
-            tau0=padded[0], tau1=padded[1], tau2=padded[2], tau3=padded[3],
-            tau4=padded[4], tau5=padded[5], tau6=padded[6], tau7=padded[7],
-            num_delays=len(prime_delays),
-            T=T, D=D, BLOCK_D=BLOCK_D,
-        )
-        return x_eff
+    if out is None:
+        out = torch.empty_like(x_states)
+    padded  = list(prime_delays) + [0] * (8 - len(prime_delays))
+    BLOCK_D = triton.next_power_of_2(D)
+    _ocns_delay_kernel[(B * T,)](
+        x_states.contiguous(), 
+        delay_gains.contiguous(), 
+        out,
+        tau0=padded[0], tau1=padded[1], tau2=padded[2], tau3=padded[3],
+        tau4=padded[4], tau5=padded[5], tau6=padded[6], tau7=padded[7],
+        num_delays=len(prime_delays),
+        T=T, D=D, BLOCK_D=BLOCK_D,
+    )
+    return out
 
 
 # ============================================================
@@ -156,26 +153,22 @@ def _state_update_kernel(
     x = tl.load(x_states_ptr + off, mask=mask, other=0.0)
     s = tl.load(step_ptr      + off, mask=mask, other=0.0)
 
-    # NaN Protection: Set NaN steps to 0 (Siphon effect)
-    s = tl.where(s != s, 0.0, s)
+    s = tl.where(s != s, 0.0, s) # NaN siphon
 
     s_clamped = tl.minimum(tl.maximum(s, -10.0), 10.0)
     tl.store(x_states_ptr + off, x + lr * s_clamped, mask=mask)
 
 
 def fused_state_update(x_states, step, current_lr):
-    # CRITICAL: Assertion to prevent copy-bug regression
     assert x_states.is_contiguous(), "State update must be in-place on contiguous tensor"
-    device = x_states.device
-    with torch.cuda.device(device):
-        numel = x_states.numel()
-        BLOCK = 1024
-        grid  = ((numel + BLOCK - 1) // BLOCK,)
-        _state_update_kernel[grid](
-            x_states, 
-            step.contiguous(),
-            lr=float(current_lr), numel=numel, BLOCK=BLOCK,
-        )
+    numel = x_states.numel()
+    BLOCK = 1024
+    grid  = ((numel + BLOCK - 1) // BLOCK,)
+    _state_update_kernel[grid](
+        x_states, 
+        step.contiguous(),
+        lr=float(current_lr), numel=numel, BLOCK=BLOCK,
+    )
 
 
 # ============================================================
@@ -197,11 +190,8 @@ def _normalize_activate_kernel(
     r = tl.load(output_ptr + row + d_off * 2,     mask=mask, other=0.0) / count
     i = tl.load(output_ptr + row + d_off * 2 + 1, mask=mask, other=0.0) / count
 
-    # Safe Normalize: prevent inf/nan poisoning
     mag    = tl.sqrt(r * r + i * i)
     is_bad = (mag > 1e18) | (mag != mag)
-    
-    # Broadcast condition
     bad_mask = tl.broadcast_to(is_bad, (BLOCK_D,))
     
     safe_mag      = tl.where(bad_mask, 1.0, tl.maximum(mag, 1e-8))
@@ -212,17 +202,16 @@ def _normalize_activate_kernel(
     tl.store(result_ptr + row + d_off * 2 + 1, (i / safe_mag) * activated_mag, mask=mask)
 
 
-def fused_normalize_activate(output, counts, bias):
+def fused_normalize_activate(output, counts, bias, out=None):
     B_T, D, _ = output.shape
-    device     = output.device
-    with torch.cuda.device(device):
-        result  = torch.empty_like(output)
-        BLOCK_D = triton.next_power_of_2(D)
-        _normalize_activate_kernel[(B_T,)](
-            output.contiguous(), 
-            counts.contiguous().view(-1), 
-            bias.contiguous(), 
-            result,
-            B_T=B_T, D=D, BLOCK_D=BLOCK_D,
-        )
-        return result
+    if out is None:
+        out = torch.empty_like(output)
+    BLOCK_D = triton.next_power_of_2(D)
+    _normalize_activate_kernel[(B_T,)](
+        output.contiguous(), 
+        counts.contiguous().view(-1), 
+        bias.contiguous(), 
+        out,
+        B_T=B_T, D=D, BLOCK_D=BLOCK_D,
+    )
+    return out
