@@ -51,6 +51,7 @@
     - **Axiom: Zero-Product NaN**: In Triton, `0.0 * inf` equals `NaN`. Never use multiplication as a mask for potentially infinite values; use strict `tl.where` gating.
     - **Axiom: The Self-Binding Trap**: Assigning a pure function to `self.func` makes it a **method**. Calling `self.func()` will inject `self` as the first argument. Always call external kernels as imported functions, never as instance attributes.
     - **Axiom: Memory Churn (The 1152 Staller)**: Allocating tensors (`torch.empty_like`) inside high-depth iterative loops (e.g., 24 layers * 48 iters) creates massive driver overhead. **Fix**: Use Persistent Buffers pre-allocated once per layer and passed as 'out' arguments to kernels.
+    - **Axiom: The Structured Ghost**: Never use string-matching auto-patching for `.ipynb` files. Treating a notebook as a text file leads to cell collisions and accidental deletions. **Protocol**: Always use structured JSON reconstruction (manual or scripted) to rebuild the cell array, never regex/string find-and-replace.
 - **[2026-04-15] Infrastructure & Diagnostic Stability:**
     - **Axiom: Hook Safety**: Mandatory `try/finally` for hooks on live models. Prevents OOM/Perf-leaks.
     - **Axiom: Timer Integrity**: Reset `t0` post-disk I/O (7.5GB saves) to stop metric inflation.
