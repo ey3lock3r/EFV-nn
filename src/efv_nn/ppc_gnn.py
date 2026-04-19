@@ -42,8 +42,8 @@ class PPCNodeLayer(nn.Module):
         self.min_iters = min_iters  # APD: hard floor, model can never learn to skip thinking
 
         # Adaptive Phasal Depth (APD): Learnable exit threshold with hard floor guard.
-        # APD: Adaptive Phasal Depth threshold (0.00001 = 0.001% phasal resonance error)
-        self.exit_threshold = nn.Parameter(torch.tensor(0.00001))
+        # APD: Adaptive Phasal Depth threshold (0.000001 = 0.0001% phasal resonance error)
+        self.exit_threshold = nn.Parameter(torch.tensor(0.000001))
 
         # OCNS Integration: Phasal Delay Embedding Gains
         self.prime_delays = list(prime_delays) if prime_delays else []
