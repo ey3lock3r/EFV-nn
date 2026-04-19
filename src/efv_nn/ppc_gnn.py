@@ -1,7 +1,18 @@
 import torch
 import torch.nn as nn
 import math
+import torch.nn.functional as F
 from efv_nn.ppc_core import ExpertChoiceMoEMatcher
+
+# Optimization: Import Triton kernels at module level to avoid loop overhead
+try:
+    from efv_nn.triton_kernels import (
+        fused_phase_rotation, fused_ocns_delay, 
+        fused_state_update, fused_normalize_activate
+    )
+    TRITON_AVAILABLE = True
+except (ImportError, Exception):
+    TRITON_AVAILABLE = False
 
 
 def spectral_guardian_penalty(layer_energies: torch.Tensor, lam: float = 0.01) -> torch.Tensor:
@@ -48,20 +59,8 @@ class PPCNodeLayer(nn.Module):
         self.register_buffer('cos_p', torch.cos(phase))
         self.register_buffer('sin_p', torch.sin(phase))
 
-        # Triton Dual-Path: attempt to import compiled kernels.
-        # Falls back to Python path silently on CPU or if Triton is unavailable.
-        self._triton_available = False
-        if use_triton and torch.cuda.is_available():
-            try:
-                from efv_nn.triton_kernels import (
-                    fused_phase_rotation,
-                    fused_ocns_delay,
-                    fused_state_update,
-                    fused_normalize_activate,
-                )
-                self._triton_available = True
-            except (ImportError, Exception):
-                pass  # Silent fallback to Python path
+        # Check for Triton availability (used in forward)
+        self._triton_available = TRITON_AVAILABLE and use_triton and torch.cuda.is_available()
 
         self.moe = ExpertChoiceMoEMatcher(hidden_dim, num_experts)
         
@@ -109,21 +108,12 @@ class PPCNodeLayer(nn.Module):
 
             # 1. Local Convergence (Frozen fixed point search)
             with torch.no_grad():
-                if torch.isnan(x_stream).any():
-                    print("⚠️ WARNING: Input x_stream contains NaNs!")
-                
                 # Force to float32 and ensure it's on the same device as the layer weights
-                # This fixes the "cpu tensor?" error during resumption.
                 device = self.cos_p.device
                 x_states = x_stream.clone().detach().float().to(device)
-                
-                if x_states.device.type == 'cpu':
-                    print(f"⚠️ CRITICAL: x_states is on CPU! Layer device: {device}")
 
                 # --- Phase Rotation + Target Construction ---
                 if self._triton_available:
-                    # Call imported functions directly to avoid 'self' binding bug
-                    from efv_nn.triton_kernels import fused_phase_rotation
                     x_target_frozen = fused_phase_rotation(
                         x_states, self.cos_p, self.sin_p
                     )
@@ -147,7 +137,6 @@ class PPCNodeLayer(nn.Module):
 
                     # --- OCNS INJECTION POINT 1 ---
                     if self._triton_available and self.prime_delays:
-                        from efv_nn.triton_kernels import fused_ocns_delay
                         x_eff = fused_ocns_delay(
                             x_states, self.delay_gains, self.prime_delays
                         )
@@ -166,13 +155,11 @@ class PPCNodeLayer(nn.Module):
                         ).float().reshape(B, T, D, 2)
                         # --- State Update ---
                         if self._triton_available:
-                            from efv_nn.triton_kernels import fused_state_update
                             fused_state_update(x_states, step, current_lr)
                         else:
                             x_states.add_(torch.clamp(step, -10.0, 10.0), alpha=current_lr)
                     else:
                         if self._triton_available:
-                            from efv_nn.triton_kernels import fused_state_update
                             fused_state_update(x_states, residual, current_lr)
                         else:
                             x_states.add_(torch.clamp(residual, -10.0, 10.0), alpha=current_lr)
