@@ -38,9 +38,8 @@ class ShardedPPCGraphLLM(nn.Module):
             ).to(target_device)
 
             # Triton kernels are pre-compiled on first call — no cold start needed.
-            # torch.compile is only applied as fallback when Triton is unavailable.
-            if not layer._triton_available:
-                layer = torch.compile(layer, mode="reduce-overhead")
+            # CUDAGraphs Exorcism: We do not use torch.compile as it corrupts memory pools
+            # during dynamic DEQ loop execution.
             self.layers.append(layer)
 
         # 3. Output Head (GPU 1)

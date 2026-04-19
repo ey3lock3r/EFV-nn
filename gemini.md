@@ -54,6 +54,7 @@
     - **Axiom: The Structured Ghost**: Never use string-matching auto-patching for `.ipynb` files. Treating a notebook as a text file leads to cell collisions and accidental deletions. **Protocol**: Always use structured JSON reconstruction (manual or scripted) to rebuild the cell array, never regex/string find-and-replace.
     - **Axiom: The Stale Reference Trap**: `from module import function` binds the function at import time. `importlib.reload(module)` will NOT update existing references in other modules. **Fix**: Always use `from package import module` and call `module.function()` to ensure reloads are globally effective.
     - **Axiom: The Shape Juggling Tax**: Mismatched dimensions between Model (4D) and Kernels (3D) lead to cascading `ValueError`. **Fix**: Standardize all Triton wrappers to accept native Model shapes (`[B, T, D, 2]`) and handle internal flattening/unflattening automatically.
+    - **Axiom: CUDAGraphs Exorcism**: `torch.compile(mode="reduce-overhead")` forces CUDAGraphs, which assumes a static memory pool. Switching between `no_grad` (DEQ iterations) and `grad` (Gradient Bridge) corrupts this pool (`curr_block->next == nullptr` crash). **Fix**: Rely solely on custom Triton kernels and manual FP16 contiguity optimizations; avoid `torch.compile` in the loop.
 - **[2026-04-15] Infrastructure & Diagnostic Stability:**
     - **Axiom: Hook Safety**: Mandatory `try/finally` for hooks on live models. Prevents OOM/Perf-leaks.
     - **Axiom: Timer Integrity**: Reset `t0` post-disk I/O (7.5GB saves) to stop metric inflation.
