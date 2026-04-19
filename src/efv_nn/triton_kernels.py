@@ -113,7 +113,7 @@ def _ocns_delay_kernel(
 
             gain_base = idx * D * 2
             gr = tl.load(delay_gains_ptr + gain_base + d_off * 2,     mask=mask, other=0.0)
-            gi = tl.load(delay_gains_ptr + delay_gains_ptr + gain_base + d_off * 2 + 1, mask=mask, other=0.0)
+            gi = tl.load(delay_gains_ptr + gain_base + d_off * 2 + 1, mask=mask, other=0.0)
 
             acc_r += (dr * gr - di * gi) * valid_int.to(tl.float32)
             acc_i += (dr * gi + di * gr) * valid_int.to(tl.float32)
