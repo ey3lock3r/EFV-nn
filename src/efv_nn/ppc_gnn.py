@@ -60,10 +60,10 @@ class PPCNodeLayer(nn.Module):
         self._triton_available = TRITON_AVAILABLE and use_triton and torch.cuda.is_available()
 
         self.moe = ppc_core.ExpertChoiceMoEMatcher(hidden_dim, num_experts=num_experts)
-        # Pillar 5: Selective Compilation. Compile the MoE to fuse its small sub-kernels.
-        # This is safe because MoE is pure PyTorch; the Triton loop remains external.
-        if self._triton_available:
-            self.moe = torch.compile(self.moe, mode="reduce-overhead")
+        # Pillar 5: Selective Compilation (REMOVED)
+        # We previously compiled the MoE, but CUDAGraphs (used in reduce-overhead) 
+        # corrupts the memory pool when switching between no_grad (loop) and grad (bridge).
+        # Our manual FP16 matmul optimizations are sufficient.
 
         # Persistent Buffers (avoiding allocation churn)
         self._target_buf = None
@@ -111,6 +111,9 @@ class PPCNodeLayer(nn.Module):
         with torch.amp.autocast('cuda', enabled=False):
             B, T, D, _ = x_stream.shape
             iters_run = 0
+
+            # PERFORMANCE: Cache contiguous MoE weights OUTSIDE no_grad so gradients flow naturally
+            self.moe.cache_weights()
 
             # 1. Local Convergence (Frozen fixed point search)
             with torch.no_grad():
@@ -180,8 +183,8 @@ class PPCNodeLayer(nn.Module):
 
                     # --- Adaptive Phasal Depth: Early Exit (Check every 8 iters to avoid sync overhead) ---
                     if (i + 1) >= self.min_iters and (i + 1) % 8 == 0:
-                        # Optimization: Use squared norm to avoid sync and sqrt
-                        res_sq = torch.sum(residual * residual)
+                        # Optimization: Use squared norm (averaged) to avoid sync and sqrt
+                        res_sq = torch.mean(residual * residual) * 2
                         if res_sq.item() < exit_thr_sq:
                             break
                         if torch.isnan(res_sq):
@@ -221,6 +224,7 @@ class PPCNodeLayer(nn.Module):
             # Calculate final resonance energy (L2 norm of error) for swarm/diagnostics
             # Remove no_grad() to allow Spectral Guardian to penalise phasal jitter
             res_norm = torch.norm(x_target_frozen - prediction_grad, dim=-1).mean()
+            self.moe.clear_cache()
 
         if unbatched:
             out = out.squeeze(0)

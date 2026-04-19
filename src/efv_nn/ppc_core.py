@@ -83,6 +83,19 @@ class ExpertChoiceMoEMatcher(nn.Module):
 
         self.activation = ModReLU(hidden_dim)
 
+    def cache_weights(self):
+        """Pre-slice and align weights to prevent memory allocation in DEQ loops."""
+        self._wr_h = self.experts_weight_real[..., 0].contiguous()
+        self._wi_h = self.experts_weight_real[..., 1].contiguous()
+        self._wr_t = self._wr_h.transpose(-2, -1).contiguous()
+        self._wi_t = self._wi_h.transpose(-2, -1).contiguous()
+
+    def clear_cache(self):
+        self._wr_h = None
+        self._wi_h = None
+        self._wr_t = None
+        self._wi_t = None
+
     def forward(self, x, gate_bias=None):
         """
         [B_T, D, 2] interleaved real -> [B_T, D, 2]
@@ -118,9 +131,11 @@ class ExpertChoiceMoEMatcher(nn.Module):
         xr_h, xi_h = x_batched[..., 0].half(), x_batched[..., 1].half()
         
         # Ensure contiguous memory before hitting cuBLAS to prevent illegal memory access
-        # (self.experts_weight_real is already .half() from __init__)
-        wr_h = self.experts_weight_real[..., 0].contiguous()
-        wi_h = self.experts_weight_real[..., 1].contiguous()
+        if hasattr(self, '_wr_h') and self._wr_h is not None:
+            wr_h, wi_h = self._wr_h, self._wi_h
+        else:
+            wr_h = self.experts_weight_real[..., 0].contiguous()
+            wi_h = self.experts_weight_real[..., 1].contiguous()
 
         # Fast FP16 multiplication on Tensor Cores, instantly cast back to f32 
         # for mathematical stability in the surrounding DEQ accumulation
@@ -166,8 +181,11 @@ class ExpertChoiceMoEMatcher(nn.Module):
         yr_h, yi_h = res_batched[..., 0].half(), res_batched[..., 1].half()
         
         # Transpose and then ensure contiguous memory layout
-        wr_t = self.experts_weight_real[..., 0].transpose(-2, -1).contiguous()
-        wi_t = self.experts_weight_real[..., 1].transpose(-2, -1).contiguous()
+        if hasattr(self, '_wr_t') and self._wr_t is not None:
+            wr_t, wi_t = self._wr_t, self._wi_t
+        else:
+            wr_t = self.experts_weight_real[..., 0].transpose(-2, -1).contiguous()
+            wi_t = self.experts_weight_real[..., 1].transpose(-2, -1).contiguous()
         
         grad_r = torch.matmul(yr_h, wr_t).float() + torch.matmul(yi_h, wi_t).float()
         grad_i = torch.matmul(yi_h, wr_t).float() - torch.matmul(yr_h, wi_t).float()
