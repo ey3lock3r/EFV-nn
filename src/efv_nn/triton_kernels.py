@@ -1,11 +1,11 @@
 """
-Triton Kernels for PPC-GNN (Triton 3.x compatible).
+Triton Kernels for PPC-GNN (Triton 3.6.0 compatible).
 
-Key Triton 3.x rules applied:
-  - No `if` on runtime tensors. Use tl.where() and masked loads.
-  - All pointer offsets cast to tl.int64 to prevent 32-bit overflow.
-  - Scalar float kernel args typed as tl.constexpr where needed.
-  - Explicit .data_ptr() passing in wrappers for stability.
+Key Triton 3.6.0 fixes applied:
+  - Removed tl.where() on scalars (now illegal in 3.x).
+  - Used Boolean-to-Integer math for conditional logic.
+  - Explicit .data_ptr() passing for pointer stability.
+  - Explicit tl.int64 casts for all offset calculations.
 """
 
 import torch
@@ -28,24 +28,33 @@ def _phase_rotation_kernel(
     d_off = tl.arange(0, BLOCK_D).to(tl.int64)
     mask  = d_off < D
 
-    # Always load current token (used when t == 0)
+    # t == 0 condition as integer (1 if t > 0, 0 if t == 0)
+    has_prev_int = (t > 0).to(tl.int64)
+    
+    # Calculate previous row offset safely
+    # If t=0, has_prev_int=0, so prev_pid = pid (safe load of current token)
+    # If t>0, has_prev_int=1, so prev_pid = pid - 1 (load previous token)
+    prev_pid = pid - has_prev_int
+    prev_row = prev_pid * D * 2
+
+    # Load current token
     cur_r = tl.load(x_states_ptr + row + d_off * 2,     mask=mask, other=0.0)
     cur_i = tl.load(x_states_ptr + row + d_off * 2 + 1, mask=mask, other=0.0)
 
-    # Load prev token (safe even when t == 0 due to mask)
-    has_prev  = t > 0
-    prev_row  = tl.where(has_prev, pid - 1, pid) * D * 2
-    prev_r    = tl.load(x_states_ptr + prev_row + d_off * 2,     mask=mask, other=0.0)
-    prev_i    = tl.load(x_states_ptr + prev_row + d_off * 2 + 1, mask=mask, other=0.0)
-    cos_p     = tl.load(cos_p_ptr + d_off, mask=mask, other=0.0)
-    sin_p     = tl.load(sin_p_ptr + d_off, mask=mask, other=0.0)
+    # Load and rotate previous token
+    prev_r = tl.load(x_states_ptr + prev_row + d_off * 2,     mask=mask, other=0.0)
+    prev_i = tl.load(x_states_ptr + prev_row + d_off * 2 + 1, mask=mask, other=0.0)
+    cos_p  = tl.load(cos_p_ptr + d_off, mask=mask, other=0.0)
+    sin_p  = tl.load(sin_p_ptr + d_off, mask=mask, other=0.0)
 
     rot_r = prev_r * cos_p - prev_i * sin_p
     rot_i = prev_r * sin_p + prev_i * cos_p
 
-    # t == 0 → copy current; t > 0 → write rotated prev
-    out_r = tl.where(has_prev, rot_r, cur_r)
-    out_i = tl.where(has_prev, rot_i, cur_i)
+    # Final result: combine using the integer flag
+    # If has_prev_int=1: rot_r
+    # If has_prev_int=0: cur_r
+    out_r = has_prev_int.to(tl.float32) * rot_r + (1.0 - has_prev_int.to(tl.float32)) * cur_r
+    out_i = has_prev_int.to(tl.float32) * rot_i + (1.0 - has_prev_int.to(tl.float32)) * cur_i
 
     tl.store(x_target_ptr + row + d_off * 2,     out_r, mask=mask)
     tl.store(x_target_ptr + row + d_off * 2 + 1, out_i, mask=mask)
@@ -87,25 +96,37 @@ def _ocns_delay_kernel(
     acc_r = tl.load(x_states_ptr + row + d_off * 2,     mask=mask, other=0.0)
     acc_i = tl.load(x_states_ptr + row + d_off * 2 + 1, mask=mask, other=0.0)
 
-    taus = (tau0, tau1, tau2, tau3, tau4, tau5, tau6, tau7)
-    for idx in tl.static_range(num_delays):
-        tau: tl.constexpr = taus[idx]
+    # We unroll the loop manually to avoid constexpr tuple indexing issues in 3.6
+    for idx in tl.static_range(8):
+        if idx < num_delays:
+            # Map idx to constexpr tau
+            if idx == 0: tau = tau0
+            elif idx == 1: tau = tau1
+            elif idx == 2: tau = tau2
+            elif idx == 3: tau = tau3
+            elif idx == 4: tau = tau4
+            elif idx == 5: tau = tau5
+            elif idx == 6: tau = tau6
+            else: tau = tau7
 
-        # Only accumulate for tokens that have a valid history
-        valid    = t >= tau
-        src_pid  = tl.where(valid, pid - tau, pid)
-        hist_row = src_pid * D * 2
-        hist_mask = mask & valid
+            # Math-based history access
+            valid_int = (t >= tau).to(tl.int64)
+            src_pid   = pid - (valid_int * tau) 
+            hist_row  = src_pid * D * 2
+            
+            # Mask out loads for invalid history tokens
+            hist_mask = mask & (valid_int > 0)
 
-        dr = tl.load(x_states_ptr + hist_row + d_off * 2,     mask=hist_mask, other=0.0)
-        di = tl.load(x_states_ptr + hist_row + d_off * 2 + 1, mask=hist_mask, other=0.0)
+            dr = tl.load(x_states_ptr + hist_row + d_off * 2,     mask=hist_mask, other=0.0)
+            di = tl.load(x_states_ptr + hist_row + d_off * 2 + 1, mask=hist_mask, other=0.0)
 
-        gain_base = (idx * D * 2)
-        gr = tl.load(delay_gains_ptr + gain_base + d_off * 2,     mask=mask, other=0.0)
-        gi = tl.load(delay_gains_ptr + gain_base + d_off * 2 + 1, mask=mask, other=0.0)
+            gain_base = (idx * D * 2)
+            gr = tl.load(delay_gains_ptr + gain_base + d_off * 2,     mask=mask, other=0.0)
+            gi = tl.load(delay_gains_ptr + gain_base + d_off * 2 + 1, mask=mask, other=0.0)
 
-        acc_r += dr * gr - di * gi
-        acc_i += dr * gi + di * gr
+            # Accumulate (multiplied by valid_int to be extra safe)
+            acc_r += (dr * gr - di * gi) * valid_int.to(tl.float32)
+            acc_i += (dr * gi + di * gr) * valid_int.to(tl.float32)
 
     tl.store(x_eff_ptr + row + d_off * 2,     acc_r, mask=mask)
     tl.store(x_eff_ptr + row + d_off * 2 + 1, acc_i, mask=mask)
@@ -174,8 +195,8 @@ def _normalize_activate_kernel(
     mask  = d_off < D
     row   = pid * D * 2
 
-    count = tl.load(counts_ptr + pid)
-    count = tl.maximum(count, 1.0)
+    count_val = tl.load(counts_ptr + pid)
+    count = tl.maximum(count_val, 1.0)
 
     r = tl.load(output_ptr + row + d_off * 2,     mask=mask, other=0.0) / count
     i = tl.load(output_ptr + row + d_off * 2 + 1, mask=mask, other=0.0) / count
