@@ -55,9 +55,16 @@
     - **Axiom: The Stale Reference Trap**: `from module import function` binds the function at import time. `importlib.reload(module)` will NOT update existing references in other modules. **Fix**: Always use `from package import module` and call `module.function()` to ensure reloads are globally effective.
     - **Axiom: The Shape Juggling Tax**: Mismatched dimensions between Model (4D) and Kernels (3D) lead to cascading `ValueError`. **Fix**: Standardize all Triton wrappers to accept native Model shapes (`[B, T, D, 2]`) and handle internal flattening/unflattening automatically.
     - **Axiom: CUDAGraphs Exorcism**: `torch.compile(mode="reduce-overhead")` forces CUDAGraphs, which assumes a static memory pool. Switching between `no_grad` (DEQ iterations) and `grad` (Gradient Bridge) corrupts this pool (`curr_block->next == nullptr` crash). **Fix**: Rely solely on custom Triton kernels and manual FP16 contiguity optimizations; avoid `torch.compile` in the loop.
-- **[2026-04-19] Phase 6 Hard Stabilization (The Native Pivot):**
-    -   **Axiom: Weight Cache (The 147GB Copy)**: Slicing interleaved real parameters `[..., 2]` inside a tight loop (48 iters) forces a `.contiguous()` allocation every single call. At 3.2B params, this moves **147 GB** per step. **Fix**: Implement `cache_weights()` outside the loop to pre-align FP16 views and eliminate allocation overhead.
-    -   **Axiom: APD Mathematics**: Early Exit logic using `torch.sum(residual**2)` is numerically unreachable due to sequence-length scaling. **Fix**: Use `torch.mean(residual**2) * 2` to align with the normalized `res_norm` metric, allowing early exit at iteration 8.
+- **[2026-04-20] Phase 6: Semantic Squeeze & Atomic Audits:**
+    - **Axiom: The Semantic Squeeze**: 64 iters + 5e-6 LR "wakes up" experts, causing a linear energy climb (1.4e-5). Mandatory to break syntactic Word Salad.
+    - **Axiom: Precision Cooling**: Dropping to 1e-6 LR + 0.0005 Thr allows the model to settle into semantic fixed points discovered during the Squeeze.
+    - **Axiom: The "15.0 Iter" Signature**: An average of 15.0 iters (24-layer) signals a perfect 8/16 layer-wise phasal split; the Efficiency Frontier.
+    - **Axiom: Pop & Purge Loader**: To load 7.5GB models in 30GB RAM, components must be "popped" and deleted from the state_dict immediately after extraction.
+    - **Axiom: Atomic Audits**: Verification must use a tightened threshold (0.00001) and deeper floor (32 iters) to show the model's true phasal potential.
+    - **Axiom: Inference "Safety Shield"**: Wrapping sandbox calls in `with torch.no_grad():` is critical to prevent gradient accumulation.
+    - **Mistake: The Cell-Replace Trap**: Overwriting a notebook cell based on a `def func` match can delete other functions in that cell. **Protocol**: Verify cell boundaries before any Overwrite.
+    - **Mistake: Indentation & Save Spikes**: Checkpoint saves must reset the timer (`t0`) inside the save-block to prevent disk-latency from leaking into performance metrics.
+    - **Mistake: Missing Variable 'RESUME'**: Accidental deletion of cell-scope configuration variables during iterative updates is a high-frequency risk.
     -   **Axiom: Atomic Move (The 20GB Ceiling)**: High-safety saves (`shutil.copy` + `.tmp`) consume 3x model size (22.5GB). **Fix**: Use `shutil.move` for atomic rotation to keep disk usage at 2x (15GB), fitting within Kaggle's 20GB limit.
     -   **Axiom: Ghost-Blind Loading**: Checkpoints from compiled sessions contain `_orig_mod` prefixes. **Fix**: Use a dynamic state-dict mapper to strip prefixes during loading, ensuring native models can resume from compiled weights.
     -   **Axiom: Ghost Persistence**: `importlib.reload` cannot flush classes hot-patched by Dynamo. A **Full Kernel Restart** is mandatory to clear stale optimized references from Python's RAM.
@@ -96,8 +103,13 @@
 
 ## 5. Scaling & Optimization Roadmap
 - **Adaptive Phasal Depth (APD)**: 
-    - Implement Energy-based Early Exit. Tokens with $E < \epsilon$ exit the loop early.
-    - Target: 3x-5x speedup in inference/training throughput.
+    - [DONE] Implement Energy-based Early Exit. Tokens with $E < \epsilon$ exit the loop early.
+    - [DONE] Target: 15.0 iter average achieved (4x speedup).
+- **Advanced Phasal Intelligence (Smashing the 7.0 Wall)**:
+    - **Spectral Annealing**: Implement a phasal cooling schedule (e.g., $Thr: 0.0005 \to 0.00005$) over 100k steps to force semantic crystallization.
+    - **Energy-Weighted Expert Choice**: Route tokens to specialized experts based on their Phasal Energy (e.g., "Stabilizer" experts for high-energy tokens).
+    - **Adaptive Spectral Guardian**: Link the guardian penalty strength to the rolling loss average to balance phasal exploration vs. stability.
+    - **OCNS Harmonic Priming**: Implement high-frequency learning rates for Phasal Gains to synchronize causal memory with logic wavefronts.
 - **Triton Kernel Fusion**:
     - Rewrite `PPCNodeLayer` iterative loop in raw Triton. 
     - Target: Eliminate `torch.compile` cold-start latency and fuse MoE/OCNS into a single SRAM kernel.
@@ -105,13 +117,3 @@
     - Move Experts to 4-bit NormalFloat (NF4) while keeping PPC core in FP32.
     - Target: Scale to 6.4B parameters on Dual-T4 hardware without OOM.
 
-### Phase 6: Hard Stabilization & Phasal Resonance (3.2B)
-- **Mistake: The "Frozen Target" Trap**: Initially, the phasal target was computed once before the DEQ loop. This allowed the model to "cheat" by hitting a static goal instantly.
-- **Fix: Moving Target Logic**: Moving target construction **INSIDE** the loop forced the model to chase a dynamic fixed point, finally unlocking the hidden semantic precision.
-- **Learning: Global Mean Dilution**: Using `mean(residual)` in APD allowed easy tokens (80%) to "cloak" hard tokens (20%).
-- **Fix: "Weakest Link" Policy**: Switching to `max(token_error)` ensures the model iterates until the **single hardest token** in the batch is satisfied.
-- **The Atomic Limit**: Found that `0.000005` (5 micro-resonance) is the Phase 6 "Sweet Spot." Tightening to `0.000001` leads to "Infinite Thinking" (48 iters) with diminishing returns.
-- **Live-Tune Protocol**: Implementing hyperparameter injection into training signatures allows for real-time precision tuning without kernel restarts.
-- **Learning: VRAM Hygiene (Training vs. Inference)**: In VRAM-constrained environments (Kaggle), stale optimizer states and gradients from training can cause OOMs during generation. Explicit `gc.collect()` and `torch.cuda.empty_cache()` at the start of interactive cells is mandatory.
-- **Learning: Inference "Safety Shield"**: Wrapping notebook generation calls in `with torch.no_grad():` is critical defensive programming to prevent accidental gradient accumulation in sandbox environments.
-- **Learning: Phasal Depth "Snapping"**: Low-frequency APD checks (e.g., every 8 steps) can hide the model's true variance, making it look "robotic." High-frequency audits reveal the underlying adaptive behavior of the phasal wavefront.
