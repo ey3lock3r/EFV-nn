@@ -55,6 +55,7 @@ def anderson_acceleration(f: Callable, x0: torch.Tensor, m: int = 5, lam: float 
             
         # Regularization: 1e-3 is safer than 1e-4 for initial phasal resonance
         lam_stable = lam * 10 if k < 5 else lam
+        dG_T = dG.transpose(1, 2)
         A = torch.bmm(dG_T, dG) + lam_stable * torch.eye(m_k, dtype=x.dtype, device=x.device).unsqueeze(0)
         b = torch.bmm(dG_T, res_k.unsqueeze(-1))
         
