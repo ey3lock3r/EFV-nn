@@ -30,6 +30,7 @@
         4. **Metric Flushing**: Mandatory `wandb.finish()`.
         5. **Sampling Policy**: No `argmax`; use Top-K/Multinomial.
         6. **Patch Boundary**: Verify cell headers for notebook edits.
+    -   **Verification Protocol**: Every core library fix (`src/`) MUST be verified with a `verify_no_triton.py` (CPU-fallback) script before pushing, if applicable. Triton-specific logic must be live-validated on Kaggle.
     -   **Numerical Audit**: Verify "Positive Delta" (Loss/Energy/Expert Diversity) before Pushes to Master.
 4.  **Phase D: Axiomatic Closure**: 
     -   **Post-Flight Encoding**: Use **High-Density Encoding** (Technical Shorthand) for Section 4 logs. Ensure **Zero Information Loss** while minimizing token bloat.
@@ -41,6 +42,7 @@
 ## 4. Learnings & Mistakes Diary (High-Density)
 - **[2026-04-21] PPC-GNN V3 Validation & System Hardening:**
     - **ComplexGELU over ModReLU**: Activating real and imaginary parts independently (ComplexGELU) natively respects Wirtinger calculus, unlocking stable non-linear phase mixing without destroying the implicit backward pass.
+    - **Contractive Clipping Axiom**: In DEQ loops, phasal resonance can become unstable during Phase 0 initialization. Hardening requires FP32 solvers, Anderson alpha-clipping (±1.0), and state-update clamping (±10.0) to prevent the "Divergence Spiral".
     - **DEQ Ghost-Cache Accumulation (The 25GB Leak)**: Caching MoE FP32 weights before a DEQ layer and clearing them in the backward pass causes massive VRAM leakage across layers during the forward pass (e.g., $12 \times 2.14GB = 25.7GB$). **Fix**: Pass `setup_fn` and `cleanup_fn` directly into `DEQFunction` to restrict MoE caching strictly to the active micro-iterations.
     - **Triton Pythonic Type-Coercion Trap**: In Python 3, `pid / N` silently coerces to `float32`. Triton strictly throws `IncompatibleTypeErrorImpl` when this float touches memory pointers. **Fix**: Always use floor division `//` for Triton index grids.
     - **PagedAdamW Multi-GPU Resurrection**: When loading a `bitsandbytes` optimizer from a CPU checkpoint (`map_location='cpu'`), native `load_state_dict()` leaves momentum tensors on the CPU. **Fix**: Explicitly loop through `opt.state` and map each tensor to its specific `param.device` to prevent multi-GPU crashes.
