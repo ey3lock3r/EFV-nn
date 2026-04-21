@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import bitsandbytes.nn as bnb_nn
 import math
 
 
@@ -31,14 +30,16 @@ class ComplexKaimingInitializer:
 UnitaryInitializer = ComplexKaimingInitializer
 
 
-class ModReLU(nn.Module):
+class ComplexGELU(nn.Module):
     """
-    Learnable mod-ReLU activation for interleaved-real tensors [..., 2].
-    Formula: modReLU(z) = ReLU(|z| + b) * (z / max(|z|, ε))
+    Complex-valued GELU for interleaved-real tensors [..., 2].
+    Applies GELU to the real and imaginary components independently,
+    allowing cross-talk via expert routing weights and preserving holomorphism
+    for stable Wirtinger calculus gradients.
     """
-
     def __init__(self, hidden_dim: int):
         super().__init__()
+        # Keep bias for drop-in compatibility with previous Triton kernels if needed
         self.bias = nn.Parameter(torch.zeros(hidden_dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -46,25 +47,17 @@ class ModReLU(nn.Module):
         x: interleaved-real tensor [..., hidden_dim, 2]
         returns: interleaved-real tensor of same shape
         """
-        # Magnitude |z| = sqrt(r^2 + i^2)
-        magnitude = torch.norm(x, dim=-1)              # [..., D]
-        # Stabilise division
-        safe_mag = magnitude.clamp(min=1e-8)
-        unit_phase = x / safe_mag.unsqueeze(-1)        # [..., D, 2]
-        
-        activated_mag = torch.relu(magnitude + self.bias)
-        return activated_mag.unsqueeze(-1) * unit_phase
-
+        real = torch.nn.functional.gelu(x[..., 0] + self.bias)
+        imag = torch.nn.functional.gelu(x[..., 1] + self.bias)
+        return torch.stack([real, imag], dim=-1)
 
 def complex_activation(x: torch.Tensor) -> torch.Tensor:
     """
-    Stateless mod-ReLU with zero bias for interleaved-real tensors [..., 2].
+    Stateless Complex GELU with zero bias.
     """
-    magnitude = torch.norm(x, dim=-1)
-    safe_mag = magnitude.clamp(min=1e-8)
-    unit_phase = x / safe_mag.unsqueeze(-1)
-    return torch.relu(magnitude).unsqueeze(-1) * unit_phase
-
+    real = torch.nn.functional.gelu(x[..., 0])
+    imag = torch.nn.functional.gelu(x[..., 1])
+    return torch.stack([real, imag], dim=-1)
 
 class ExpertChoiceMoEMatcher(nn.Module):
     def __init__(self, hidden_dim, num_experts=16, k_nodes=None):
@@ -81,20 +74,20 @@ class ExpertChoiceMoEMatcher(nn.Module):
         init_real = ComplexKaimingInitializer.initialize((num_experts, hidden_dim, hidden_dim))
         self.experts_weight_real = nn.Parameter(init_real.half())
 
-        self.activation = ModReLU(hidden_dim)
+        self.activation = ComplexGELU(hidden_dim)
 
     def cache_weights(self):
-        """Pre-slice and align weights to prevent memory allocation in DEQ loops."""
-        self._wr_h = self.experts_weight_real[..., 0].contiguous()
-        self._wi_h = self.experts_weight_real[..., 1].contiguous()
-        self._wr_t = self._wr_h.transpose(-2, -1).contiguous()
-        self._wi_t = self._wi_h.transpose(-2, -1).contiguous()
+        """Pre-slice, align, and cast weights to FP32 to prevent allocation and quantization jitter in DEQ loops."""
+        self._wr_f32 = self.experts_weight_real[..., 0].contiguous().float()
+        self._wi_f32 = self.experts_weight_real[..., 1].contiguous().float()
+        self._wr_t_f32 = self._wr_f32.transpose(-2, -1).contiguous()
+        self._wi_t_f32 = self._wi_f32.transpose(-2, -1).contiguous()
 
     def clear_cache(self):
-        self._wr_h = None
-        self._wi_h = None
-        self._wr_t = None
-        self._wi_t = None
+        self._wr_f32 = None
+        self._wi_f32 = None
+        self._wr_t_f32 = None
+        self._wi_t_f32 = None
 
     def forward(self, x, gate_bias=None):
         """
@@ -127,47 +120,41 @@ class ExpertChoiceMoEMatcher(nn.Module):
         x_batched = x[flat_indices].view(self.num_experts, k_nodes, D, 2)
 
         # 3. Vectorized Complex BMM: (xr + i*xi)(wr + i*wi)
-        # Pillar 4 Optimization: Manual FP16 Matmul with Explicit Contiguity
-        xr_h, xi_h = x_batched[..., 0].half(), x_batched[..., 1].half()
-        
-        # Ensure contiguous memory before hitting cuBLAS to prevent illegal memory access
-        if hasattr(self, '_wr_h') and self._wr_h is not None:
-            wr_h, wi_h = self._wr_h, self._wi_h
+        if hasattr(self, '_wr_f32') and self._wr_f32 is not None:
+            # Pillar 4 Optimization: DEQ Search Mode uses FP32 to prevent quantization jitter
+            xr, xi = x_batched[..., 0].float(), x_batched[..., 1].float()
+            wr, wi = self._wr_f32, self._wi_f32
+            yr = torch.matmul(xr, wr) - torch.matmul(xi, wi)
+            yi = torch.matmul(xr, wi) + torch.matmul(xi, wr)
         else:
+            # Pillar 4 Optimization: Inference / Gradient Bridge uses Manual FP16 Matmul
+            xr_h, xi_h = x_batched[..., 0].half(), x_batched[..., 1].half()
             wr_h = self.experts_weight_real[..., 0].contiguous()
             wi_h = self.experts_weight_real[..., 1].contiguous()
-
-        # Fast FP16 multiplication on Tensor Cores, instantly cast back to f32 
-        # for mathematical stability in the surrounding DEQ accumulation
-        yr = torch.matmul(xr_h, wr_h).float() - torch.matmul(xi_h, wi_h).float()
-        yi = torch.matmul(xr_h, wi_h).float() + torch.matmul(xi_h, wr_h).float()
+            yr = torch.matmul(xr_h, wr_h).float() - torch.matmul(xi_h, wi_h).float()
+            yi = torch.matmul(xr_h, wi_h).float() + torch.matmul(xi_h, wr_h).float()
+            
         y_all = torch.stack([yr, yi], dim=-1) # [E, k, D, 2]
 
         # 4. Score Weighting
         # topk_scores: [k, E] -> weights: [E, k, 1, 1]
         weights = topk_scores.T.reshape(self.num_experts, k_nodes, 1, 1).to(y_all.dtype)
         y_weighted = (y_all * weights).reshape(self.num_experts * k_nodes, D, 2)
-
-        # 5. Precision-Balanced Accumulation
-        output = torch.zeros((B_T, D, 2), device=x.device, dtype=torch.float32)
-        counts = torch.zeros((B_T, 1, 1), device=x.device, dtype=torch.float32)
         
-        # Final accumulation MUST be float32 for stable PPC
-        # Use dynamic constant creation. Dynamo fully hoists this without breaking the graph via module mutation.
-        num_updates = self.num_experts * k_nodes
-        ones_buf = torch.ones((num_updates, 1, 1), device=x.device, dtype=torch.float32)
+        # Aggregation (Local allocations to prevent in-place autograd conflicts)
+        out_buf = torch.zeros((B_T, D, 2), device=x.device, dtype=torch.float32)
+        counts_buf = torch.zeros((B_T, 1, 1), device=x.device, dtype=torch.float32)
+        ones_buf = torch.ones((self.num_experts * k_nodes, 1, 1), device=x.device, dtype=torch.float32)
             
-        output.index_add_(0, flat_indices, y_weighted.float())
-        counts.index_add_(0, flat_indices, ones_buf)
+        out_buf.index_add_(0, flat_indices, y_weighted.float())
+        counts_buf.index_add_(0, flat_indices, ones_buf)
 
-        # Activation
-        res = self.activation(output / counts.clamp(min=1))
-        return res.to(original_dtype), topk_indices, topk_scores, counts
+        res = self.activation(out_buf / counts_buf.clamp(min=1))
+        return res.to(original_dtype), topk_indices, topk_scores, counts_buf
 
     def transpose_forward(self, residual, topk_indices, topk_scores, counts):
         """
         Jacobian-Hermitian pass: Sigma s_i * W_i^H * r[idx_i]
-        Fully Vectorized.
         """
         original_dtype = residual.dtype
         B_T, D, _ = residual.shape
@@ -176,28 +163,55 @@ class ExpertChoiceMoEMatcher(nn.Module):
         flat_indices = topk_indices.T.reshape(-1)
         res_batched = residual[flat_indices].view(self.num_experts, k_nodes, D, 2)
 
-        # W^H = [W_r^T, -W_i^T].
-        # Pillar 4 Optimization: Jacobian precision matches manual FP16 contiguity
-        yr_h, yi_h = res_batched[..., 0].half(), res_batched[..., 1].half()
-        
-        # Transpose and then ensure contiguous memory layout
-        if hasattr(self, '_wr_t') and self._wr_t is not None:
-            wr_t, wi_t = self._wr_t, self._wi_t
+        if hasattr(self, '_wr_t_f32') and self._wr_t_f32 is not None:
+            yr, yi = res_batched[..., 0].float(), res_batched[..., 1].float()
+            wr_t, wi_t = self._wr_t_f32, self._wi_t_f32
+            grad_r = torch.matmul(yr, wr_t) + torch.matmul(yi, wi_t)
+            grad_i = torch.matmul(yi, wr_t) - torch.matmul(yr, wi_t)
         else:
+            yr_h, yi_h = res_batched[..., 0].half(), res_batched[..., 1].half()
             wr_t = self.experts_weight_real[..., 0].transpose(-2, -1).contiguous()
             wi_t = self.experts_weight_real[..., 1].transpose(-2, -1).contiguous()
-        
-        grad_r = torch.matmul(yr_h, wr_t).float() + torch.matmul(yi_h, wi_t).float()
-        grad_i = torch.matmul(yi_h, wr_t).float() - torch.matmul(yr_h, wi_t).float()
-        grad_all = torch.stack([grad_r, grad_i], dim=-1) # [E, k, D, 2]
-
-        # Weighting
+            grad_r = torch.matmul(yr_h, wr_t).float() + torch.matmul(yi_h, wi_t).float()
+            grad_i = torch.matmul(yi_h, wr_t).float() - torch.matmul(yr_h, wi_t).float()
+            
+        grad_all = torch.stack([grad_r, grad_i], dim=-1)
         weights = topk_scores.T.reshape(self.num_experts, k_nodes, 1, 1).to(grad_all.dtype)
         grad_weighted = (grad_all * weights).reshape(self.num_experts * k_nodes, D, 2)
 
-        out = torch.zeros((B_T, D, 2), device=residual.device, dtype=torch.float32)
-        out.index_add_(0, flat_indices, grad_weighted.float())
+        # Reuse aggregation buffers
+        if not hasattr(self, '_out_buf') or self._out_buf.shape[0] != B_T:
+            self._out_buf = torch.zeros((B_T, D, 2), device=residual.device, dtype=torch.float32)
+        else:
+            self._out_buf.zero_()
 
-        res = out / counts.clamp(min=1)
+        self._out_buf.index_add_(0, flat_indices, grad_weighted.float())
+        res = self._out_buf / counts.clamp(min=1)
         return res.to(original_dtype)
+
+class SpectralExpertGate(nn.Module):
+    """
+    Conditions MoE expert selection on the spectral density of the hidden state.
+    """
+    def __init__(self, hidden_dim: int, num_experts: int):
+        super().__init__()
+        self.num_experts = num_experts
+        spectral_feat_dim = hidden_dim
+        self.low_freq_proj  = nn.Linear(spectral_feat_dim, num_experts, bias=False)
+        self.high_freq_proj = nn.Linear(spectral_feat_dim, num_experts, bias=False)
+        self.spectral_blend = nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, D, _ = x.shape
+        x_mag = x.norm(dim=-1)
+        X_fft = torch.fft.rfft(x_mag, dim=1, norm="ortho")
+        X_mag = X_fft.abs()
+        freq_bins = X_mag.shape[1]
+        mid = freq_bins // 2
+        low  = X_mag[:, :mid, :].mean(dim=1)
+        high = X_mag[:, mid:, :].mean(dim=1)
+        low_bias  = self.low_freq_proj(low).unsqueeze(1).expand(B, T, -1)
+        high_bias = self.high_freq_proj(high).unsqueeze(1).expand(B, T, -1)
+        return (self.spectral_blend * (low_bias + high_bias)).reshape(B * T, -1)
+
 

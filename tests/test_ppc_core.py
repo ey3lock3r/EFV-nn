@@ -163,7 +163,7 @@ class TestPPCNodeLayer:
         layer = PPCNodeLayer(hidden_dim=hidden_dim)
         x = torch.randn(seq_len, hidden_dim, 2)
         # Act
-        out, _ = layer(x, local_iters=2)
+        out, _, _ = layer(x, local_iters=2)
         # Assert
         assert out.shape == x.shape
 
@@ -174,7 +174,7 @@ class TestPPCNodeLayer:
         layer = PPCNodeLayer(hidden_dim=16)
         x = torch.randn(8, 16, 2)
         # Act
-        out, _ = layer(x, local_iters=3)
+        out, _, _ = layer(x, local_iters=3)
         # Assert
         assert not torch.isnan(out).any(), "NaN in output"
 
@@ -195,7 +195,7 @@ class TestPPCGraphLLM:
         model = self._make_model(vocab_size=vocab_size)
         input_ids = torch.arange(seq_len) % vocab_size
         # Act
-        logits = model(input_ids, local_iters=2)
+        logits, _, _, _ = model(input_ids, local_iters=2)
         # Assert
         assert logits.shape == (seq_len, vocab_size), \
             f"Expected ({seq_len}, {vocab_size}), got {logits.shape}"
@@ -207,7 +207,7 @@ class TestPPCGraphLLM:
         model = self._make_model()
         input_ids = torch.randint(0, 10, (12,))
         # Act
-        logits = model(input_ids)
+        logits, _, _, _ = model(input_ids)
         # Assert
         assert not torch.isnan(logits).any(), "NaN detected in model logits"
 
@@ -224,7 +224,7 @@ class TestPPCGraphLLM:
         criterion = nn.CrossEntropyLoss()
 
         def compute_loss():
-            logits = model(input_ids)
+            logits, _, _, _ = model(input_ids)
             return criterion(logits[:-1], target_ids[:-1])
 
         # Act

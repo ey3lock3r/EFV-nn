@@ -3,6 +3,8 @@ import torch.nn as nn
 import math
 import torch.nn.functional as F
 from efv_nn import ppc_core
+from efv_nn.ppc_core import SpectralExpertGate
+from efv_nn.deq_solvers import anderson_acceleration, DEQFunction
 
 # Optimization: Import Triton kernels as module to allow dynamic reloads
 try:
@@ -59,6 +61,7 @@ class PPCNodeLayer(nn.Module):
         # Check for Triton availability (used in forward)
         self._triton_available = TRITON_AVAILABLE and use_triton and torch.cuda.is_available()
 
+        self.spectral_gate = SpectralExpertGate(hidden_dim, num_experts)
         self.moe = ppc_core.ExpertChoiceMoEMatcher(hidden_dim, num_experts=num_experts)
         # Pillar 5: Selective Compilation (REMOVED)
         # We previously compiled the MoE, but CUDAGraphs (used in reduce-overhead) 
@@ -115,134 +118,64 @@ class PPCNodeLayer(nn.Module):
             # PERFORMANCE: Cache contiguous MoE weights OUTSIDE no_grad so gradients flow naturally
             self.moe.cache_weights()
 
-            # 1. Local Convergence (Frozen fixed point search)
-            with torch.no_grad():
-                device = self.cos_p.device
-                x_states = x_stream.clone().detach().float().to(device)
+            # Pillar 1: Compute Spectral Routing Bias once per layer
+            gate_bias = self.spectral_gate(x_stream) if hasattr(self, 'spectral_gate') else None
 
-                # Buffer Management: Pre-allocate or reuse
-                if self._triton_available:
-                    if self._target_buf is None or self._target_buf.shape != x_states.shape:
-                        self._target_buf = torch.empty_like(x_states)
-                        self._eff_buf    = torch.empty_like(x_states)
-                        self._final_buf  = torch.empty_like(x_states)
-
-                # APD: get exit threshold value (clamped to positive, honoring min_iters floor)
-                exit_thr_sq = self.exit_threshold.item() ** 2
-
-                current_lr = self.base_local_lr
-                for i in range(local_iters):
-                    iters_run += 1
-
-                    # --- PHASE 1: TARGET CONSTRUCTION (MOVING TARGET) ---
-                    # In PPC, the target for x[t] is the phasal rotation of the *current* x[t-1].
-                    # By moving this inside the loop, we force the model to chase a dynamic fixed point.
-                    if self._triton_available:
-                        x_target = triton_kernels.fused_phase_rotation(
-                            x_states, self.cos_p, self.sin_p, out=self._target_buf
-                        )
-                    else:
-                        x_prev = x_states[:, :-1, :, :]
-                        prev_r, prev_i = x_prev[..., 0], x_prev[..., 1]
-                        rot_r = prev_r * self.cos_p - prev_i * self.sin_p
-                        rot_i = prev_r * self.sin_p + prev_i * self.cos_p
-                        rot_prev = torch.stack([rot_r, rot_i], dim=-1)
-                        x_target = torch.zeros_like(x_states, dtype=torch.float32)
-                        x_target[:, 1:, :, :] = rot_prev
-                        x_target[:, 0, :, :] = x_states[:, 0, :, :]
-
-                    # --- OCNS INJECTION POINT 1 ---
-                    if self._triton_available and self.prime_delays:
-                        x_eff = triton_kernels.fused_ocns_delay(
-                            x_states, self.delay_gains, self.prime_delays, out=self._eff_buf
-                        )
-                    else:
-                        x_eff = self._apply_ocns_delays(x_states)
-
-                    prediction, indices, scores, counts = self.moe(
-                        x_eff.reshape(B * T, D, 2), gate_bias=gate_bias
-                    )
-                    prediction = prediction.float().reshape(B, T, D, 2)
-                    residual = x_target - prediction
-
-                    if self.use_jacobian:
-                        step = self.moe.transpose_forward(
-                            residual.reshape(B * T, D, 2), indices, scores, counts
-                        ).float().reshape(B, T, D, 2)
-                        # --- State Update ---
-                        if self._triton_available:
-                            triton_kernels.fused_state_update(x_states, step, current_lr)
-                        else:
-                            x_states.add_(torch.clamp(step, -10.0, 10.0), alpha=current_lr)
-                    else:
-                        if self._triton_available:
-                            triton_kernels.fused_state_update(x_states, residual, current_lr)
-                        else:
-                            x_states.add_(torch.clamp(residual, -10.0, 10.0), alpha=current_lr)
-
-                    current_lr *= self.lr_decay
-
-                    # --- Adaptive Phasal Depth: Early Exit (Check every 8 iters for speed) ---
-                    if (i + 1) >= self.min_iters and (i + 1) % 8 == 0:
-                        # Optimization: Use Max Token Error instead of Global Mean to avoid dilution.
-                        token_res_sq = torch.mean(residual * residual, dim=(-2, -1)) * 2 # [B, T]
-                        res_sq = torch.max(token_res_sq)
-                        if res_sq.item() < exit_thr_sq:
-                            break
-                        if torch.isnan(res_sq):
-                            # Poisoning detected, but we keep thinking to see if Spectral Guardian can heal it
-                            pass
-
-                # --- Final Normalize + Activate ---
-                # This step is critical for phasal resonance stability.
-                if self._triton_available:
-                    x_states = triton_kernels.fused_normalize_activate(
-                        prediction, counts, self.moe.activation.bias, out=self._final_buf
-                    )
-                else:
-                    x_states = self._normalize_activate(prediction, counts)
-            
-            # 2. DEQ Gradient Attachment
-            # Everything here stays in float32 for the analytical bridge
-            x_prev_grad = x_stream[:, :-1, :, :]
-            pg_r, pg_i = x_prev_grad[..., 0], x_prev_grad[..., 1]
-            rg_r = pg_r * self.cos_p - pg_i * self.sin_p
-            rg_i = pg_r * self.sin_p + pg_i * self.cos_p
-            
-            x_target_grad = torch.zeros_like(x_stream, dtype=torch.float32)
-            x_target_grad[:, 1:, :, 0] = rg_r
-            x_target_grad[:, 1:, :, 1] = rg_i
-            x_target_grad[:, 0, :, :] = x_stream[:, 0, :, :]
-            
-            # --- OCNS INJECTION POINT 2 (Gradient Path) ---
-            x_eff_grad = self._apply_ocns_delays(x_states)
-            
-            prediction_grad, _, _, _ = self.moe(x_eff_grad.reshape(B*T, D, 2))
-            prediction_grad = prediction_grad.float().reshape(B, T, D, 2)
-            
-            # Bridge uses un-decayed base_local_lr
-            out = x_states + self.base_local_lr * (x_target_grad - prediction_grad)
-            
-            # Calculate final resonance energy (L2 norm of error) for swarm/diagnostics
-            # Remove no_grad() to allow Spectral Guardian to penalise phasal jitter
-            # Calculate final resonance energy (L2 norm of error) for swarm/diagnostics
-            # Use a fresh target calculation for the final gradient bridge
+            # --- PHASE 1: TARGET CONSTRUCTION (STATIONARY TARGET) ---
+            # To enable Anderson Acceleration, the target must not move during the micro-iterations.
             if self._triton_available:
-                x_target_final = triton_kernels.fused_phase_rotation(
-                    x_states, self.cos_p, self.sin_p, out=self._target_buf
+                if self._target_buf is None or self._target_buf.shape != x_stream.shape:
+                    self._target_buf = torch.empty_like(x_stream)
+                    self._eff_buf    = torch.empty_like(x_stream)
+                    self._final_buf  = torch.empty_like(x_stream)
+                
+                # We clone the output of fused_phase_rotation if we are in training mode
+                # to prevent in-place buffer modification from corrupting saved tensors for backward pass
+                _tmp_target = triton_kernels.fused_phase_rotation(
+                    x_stream, self.cos_p, self.sin_p, out=self._target_buf
                 )
+                x_target = _tmp_target.clone() if torch.is_grad_enabled() else _tmp_target
+
             else:
-                x_prev_final = x_states[:, :-1, :, :]
-                prev_r, prev_i = x_prev_final[..., 0], x_prev_final[..., 1]
+                x_prev = x_stream[:, :-1, :, :]
+                prev_r, prev_i = x_prev[..., 0], x_prev[..., 1]
                 rot_r = prev_r * self.cos_p - prev_i * self.sin_p
                 rot_i = prev_r * self.sin_p + prev_i * self.cos_p
-                rot_prev_final = torch.stack([rot_r, rot_i], dim=-1)
-                x_target_final = torch.zeros_like(x_states, dtype=torch.float32)
-                x_target_final[:, 1:, :, :] = rot_prev_final
-                x_target_final[:, 0, :, :] = x_states[:, 0, :, :]
+                rot_prev = torch.stack([rot_r, rot_i], dim=-1)
+                x_target = torch.zeros_like(x_stream, dtype=torch.float32)
+                x_target[:, 1:, :, :] = rot_prev
+                x_target[:, 0, :, :] = x_stream[:, 0, :, :]
 
-            res_norm = torch.norm(x_target_final - prediction_grad, dim=-1).mean()
-            self.moe.clear_cache()
+            # --- DEQ Callables ---
+            def f_forward_step(x, x_init, g_bias, target):
+                if self._triton_available and self.prime_delays and not torch.is_grad_enabled():
+                    x_eff = triton_kernels.fused_ocns_delay(x, self.delay_gains, self.prime_delays, out=self._eff_buf)
+                else:
+                    x_eff = self._apply_ocns_delays(x)
+                B_in, T_in, D_in, _ = x_eff.shape
+                pred, _, _, _ = self.moe(x_eff.reshape(B_in * T_in, D_in, 2), gate_bias=g_bias)
+                pred = pred.float().reshape(B_in, T_in, D_in, 2)
+                return x + self.base_local_lr * (target - pred)
+
+            def f_solver(x_init, g_bias, target):
+                exit_thr_sq = self.exit_threshold.item() ** 2
+                return anderson_acceleration(
+                    lambda x: f_forward_step(x, x_init, g_bias, target), 
+                    x_init, 
+                    m=5, max_iter=local_iters, tol=exit_thr_sq
+                )
+
+            # --- Implicit Differentiation (IFT) Bridge ---
+            # Collect all trainable parameters to ensure they are tracked by the DEQ backward solver.
+            layer_params = [p for p in self.parameters() if p.requires_grad]
+            
+            out, iters_run, res_norm = DEQFunction.apply(
+                x_stream, f_solver, f_forward_step, gate_bias, x_target, self.moe.clear_cache, *layer_params
+            )
+
+            # Fix inference memory leak: Clear the FP32 cache manually if gradient is disabled
+            if not torch.is_grad_enabled():
+                self.moe.clear_cache()
 
         if unbatched:
             out = out.squeeze(0)

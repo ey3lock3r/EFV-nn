@@ -43,7 +43,7 @@ def main():
         
         # In a biological neural network, forward passes occur continuously.
         # We simulate 3 local iterations of the Wirtinger node update per systemic clock cycle.
-        logits = model(input_ids, local_iterations=3)
+        logits, _, _, _ = model(input_ids, local_iters=3)
         
         # Loss calculated on the final token predictions
         # (Exclude the last token because there is no target for it without wrapping)

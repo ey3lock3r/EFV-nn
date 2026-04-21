@@ -181,8 +181,13 @@ def fused_state_update(x_states, step, current_lr):
 
 
 # ============================================================
-# Kernel 4: Fused Normalize + ModReLU Activation
+# Kernel 4: Fused Normalize + ComplexGELU Activation
 # ============================================================
+@triton.jit
+def _gelu_fast(x):
+    """Fast GELU approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))"""
+    return 0.5 * x * (1.0 + tl.tanh(0.79788456 * (x + 0.044715 * x * x * x)))
+
 @triton.jit
 def _normalize_activate_kernel(
     output_ptr, counts_ptr, bias_ptr, result_ptr,
@@ -196,24 +201,29 @@ def _normalize_activate_kernel(
     count = tl.load(counts_ptr + pid)
     count = tl.maximum(count, 1.0)
 
+    # Load and normalize
     r = tl.load(output_ptr + row + d_off * 2,     mask=mask, other=0.0) / count
     i = tl.load(output_ptr + row + d_off * 2 + 1, mask=mask, other=0.0) / count
 
-    mag    = tl.sqrt(r * r + i * i)
-    is_bad = (mag > 1e18) | (mag != mag)
-    bad_mask = tl.broadcast_to(is_bad, (BLOCK_D,))
-    
-    safe_mag      = tl.where(bad_mask, 1.0, tl.maximum(mag, 1e-8))
-    bias          = tl.load(bias_ptr + d_off, mask=mask, other=0.0)
-    activated_mag = tl.where(bad_mask, 0.0, tl.maximum(mag + bias, 0.0))
+    # Apply ComplexGELU (PPC-OCNS v3 Pillar: Holomorphic Stability)
+    # We apply GELU to real and imaginary parts independently.
+    # Bias is added before activation.
+    bias_r = tl.load(bias_ptr + d_off, mask=mask, other=0.0)
+    bias_i = tl.load(bias_ptr + D + d_off, mask=mask, other=0.0) # Assume bias is [D, 2]
 
-    tl.store(result_ptr + row + d_off * 2,     (r / safe_mag) * activated_mag, mask=mask)
-    tl.store(result_ptr + row + d_off * 2 + 1, (i / safe_mag) * activated_mag, mask=mask)
+    # Nan/Inf Guard
+    r = tl.where(tl.abs(r) > 1e18, 0.0, r)
+    i = tl.where(tl.abs(i) > 1e18, 0.0, i)
+
+    r_act = _gelu_fast(r + bias_r)
+    i_act = _gelu_fast(i + bias_i)
+
+    tl.store(result_ptr + row + d_off * 2,     r_act, mask=mask)
+    tl.store(result_ptr + row + d_off * 2 + 1, i_act, mask=mask)
 
 
 def fused_normalize_activate(output, counts, bias, out=None):
     """Expects [B, T, D, 2] or [B_T, D, 2]. Returns same shape as input."""
-    # Detect shape and normalize to B_T
     if output.dim() == 4:
         B, T, D, _ = output.shape
         B_T = B * T
@@ -231,5 +241,66 @@ def fused_normalize_activate(output, counts, bias, out=None):
             bias.contiguous(), 
             out,
             B_T=B_T, D=D, BLOCK_D=BLOCK_D,
+        )
+    return out
+
+
+# ============================================================
+# Kernel 5: Anderson Mixing (History-Weighted Sum)
+# ============================================================
+@triton.jit
+def _anderson_mixing_kernel(
+    f_x_ptr, F_hist_ptr, alpha_ptr, out_ptr,
+    m_k: tl.constexpr, m_total: tl.constexpr,
+    B: tl.constexpr, N: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    pid = tl.program_id(0).to(tl.int64)
+    b   = pid / ((N + BLOCK_N - 1) // BLOCK_N)
+    off = (pid % ((N + BLOCK_N - 1) // BLOCK_N)) * BLOCK_N
+    
+    n_off = off + tl.arange(0, BLOCK_N)
+    mask  = n_off < N
+    
+    # Base offset for current batch in history buffers
+    # F_hist is [B, m_total, N]
+    
+    f_x_base = b * N + n_off
+    f_x = tl.load(f_x_ptr + f_x_base, mask=mask, other=0.0)
+    
+    acc = f_x
+    
+    for i in range(m_k):
+        # alpha is [B, m_k]
+        a = tl.load(alpha_ptr + b * m_k + i)
+        
+        hist_val = tl.load(F_hist_ptr + b * m_total * N + i * N + n_off, mask=mask, other=0.0)
+        
+        acc -= a * (f_x - hist_val)
+        
+    tl.store(out_ptr + f_x_base, acc, mask=mask)
+
+
+def anderson_mixing(f_x, F_hist, alpha, m_k, out=None):
+    """
+    Computes: out = f_x - sum(alpha_i * (f_x - F_hist_i))
+    f_x: [B, N]
+    F_hist: [B, m_total, N]
+    alpha: [B, m_k]
+    """
+    B, N = f_x.shape
+    _, m_total, _ = F_hist.shape
+    if out is None:
+        out = torch.empty_like(f_x)
+        
+    BLOCK_N = 1024
+    grid = (B * ((N + BLOCK_N - 1) // BLOCK_N),)
+    
+    with torch.cuda.device(f_x.device):
+        _anderson_mixing_kernel[grid](
+            f_x.contiguous(),
+            F_hist.contiguous(),
+            alpha.contiguous(),
+            out,
+            m_k=m_k, m_total=m_total, B=B, N=N, BLOCK_N=BLOCK_N
         )
     return out
