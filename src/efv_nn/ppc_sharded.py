@@ -37,7 +37,7 @@ class ShardedPPCGraphLLM(nn.Module):
                 lr_decay=lr_decay, use_jacobian=use_jacobian,
                 prime_delays=prime_delays, use_triton=use_triton,
                 device=target_device
-            )
+            ).to(target_device)
             self.layers.append(layer)
 
             # Triton kernels are pre-compiled on first call — no cold start needed.
@@ -59,6 +59,12 @@ class ShardedPPCGraphLLM(nn.Module):
     def forward(self, input_ids: torch.Tensor, local_iters: int = 8):
         input_ids = input_ids.to(self.device0)
         x = self.embed(input_ids) # [B, T, D, 2]
+
+        if os.environ.get("PPC_DEBUG") == "1":
+            print(f"DEBUG: Layer 0 Device: {next(self.layers[0].parameters()).device}")
+            print(f"DEBUG: Layer 13 Device: {next(self.layers[13].parameters()).device}")
+            print(f"DEBUG: Layer 13 Gate Device: {self.layers[13].spectral_gate.low_freq_proj.weight.device}")
+            print(f"DEBUG: Input x Device: {x.device}")
 
         total_iters = 0
         res_energies = []
