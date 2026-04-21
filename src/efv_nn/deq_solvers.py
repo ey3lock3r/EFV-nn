@@ -61,6 +61,9 @@ def anderson_acceleration(f: Callable, x0: torch.Tensor, m: int = 5, lam: float 
         except torch._C._LinAlgError:
             alpha = torch.zeros(B, m_k, dtype=x.dtype, device=x.device)
             
+        if torch.isnan(alpha).any() or torch.isinf(alpha).any():
+            alpha = torch.zeros(B, m_k, dtype=x.dtype, device=x.device)
+            
         # --- Update History ---
         buf_idx = k % m
         X[:, buf_idx] = x_flat

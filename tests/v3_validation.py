@@ -23,6 +23,7 @@ def validate_v3():
     print(f"Device: {device}")
     
     model = PPCGraphLLM(vocab_size=vocab_size, hidden_dim=hidden_dim, num_layers=1).to(device)
+    model.float() # Convert to float32 to prevent PyTorch CPU FP16 Adam NaNs
     
     # 2. Test Forward Pass (Stationary Target + Anderson)
     print("\n[1/4] Testing Forward Pass...")

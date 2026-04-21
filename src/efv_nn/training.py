@@ -50,7 +50,14 @@ def train_ppc_sharded(model, dataloader, lr=1e-4, epochs=1, local_iterations=2):
             
             # Forward with Modern AMP
             with torch.amp.autocast('cuda'):
-                logits = model(x, local_iterations=local_iterations)
+                # V3 Model returns: logits, avg_iters, avg_energy, layer_energies
+                out = model(x, local_iterations=local_iterations)
+                if isinstance(out, tuple):
+                    logits, avg_iters, avg_energy, _ = out
+                else:
+                    logits = out
+                    avg_iters, avg_energy = 0, 0.0
+
                 B, T, V = logits.shape
                 loss = F.cross_entropy(logits.reshape(B * T, V), y.reshape(B * T))
             
@@ -74,7 +81,9 @@ def train_ppc_sharded(model, dataloader, lr=1e-4, epochs=1, local_iterations=2):
                     "train/ppl": ppl,
                     "train/tokens_per_sec": throughput,
                     "train/step": step,
+                    "train/energy": avg_energy.item() if isinstance(avg_energy, torch.Tensor) else avg_energy,
+                    "train/avg_iters": avg_iters,
                 })
-                pbar.set_postfix({"loss": f"{loss.item():.4f}", "ppl": f"{ppl:.2f}"})
+                pbar.set_postfix({"loss": f"{loss.item():.4f}", "E": f"{float(avg_energy):.3f}"})
 
     print("\nTraining Complete.")
