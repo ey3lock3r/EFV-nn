@@ -57,10 +57,10 @@ class ComplexGELU(nn.Module):
     allowing cross-talk via expert routing weights and preserving holomorphism
     for stable Wirtinger calculus gradients.
     """
-    def __init__(self, hidden_dim: int):
+    def __init__(self, hidden_dim: int, device=None, dtype=torch.float32):
         super().__init__()
         # Keep bias for drop-in compatibility with previous Triton kernels if needed
-        self.bias = nn.Parameter(torch.zeros(hidden_dim))
+        self.bias = nn.Parameter(torch.zeros(hidden_dim, device=device, dtype=dtype))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -100,8 +100,7 @@ class ExpertChoiceMoEMatcher(nn.Module):
             gain=1.0, device=device, dtype=dtype
         )
         self.experts_weight_real = nn.Parameter(init_w)
-
-        self.activation = ComplexGELU(hidden_dim)
+        self.activation = ComplexGELU(hidden_dim, device=device, dtype=dtype)
 
     def cache_weights(self):
         """Pre-slice, align, and cast weights to FP32 to prevent allocation and quantization jitter in DEQ loops."""
