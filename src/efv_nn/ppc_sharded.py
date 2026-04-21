@@ -66,7 +66,7 @@ class ShardedPPCGraphLLM(nn.Module):
             # Checkpointing is removed: We have 14GB free VRAM per T4. 
             x, iters, res_norm = layer(x, local_iters)
             x = x.clone() # Isolation: Prevent CUDA Graph buffer overwrite in loops
-            total_iters += iters
+            total_iters += float(iters)
             res_energies.append(res_norm.clone())
 
         # Move all scalars to device1 before sum to avoid cross-device error
@@ -108,7 +108,7 @@ class ShardedPPCGraphLLM(nn.Module):
             curr_x = curr_x.clone() # Isolation: Prevent CUDA Graph buffer overwrite in loops
             # res_norm is usually scalar mean, but for swarm we need per-sample
             # In swarm mode, we'll re-calculate norm locally for selection
-            total_iters += iters
+            total_iters += float(iters)
 
         # 3. Resonance Selection (Pick the ghost with the deepest convergence)
         # Reshape to [B, S, T, D, 2]
