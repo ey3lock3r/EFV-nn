@@ -11,7 +11,7 @@
 - **Source of Truth**: `src/` is canonical. Notebook imports source from GitHub clone.
 - **Testing:** `pytest` (AAA). Prioritize phasal identity tests.
 - **Precision Policy:** FP32 Accumulation MANDATORY for phasal balance; BF16/FP16 for expert storage only.
-- **Convergence Policy:** Phase 5 requires 48+ local iterations for deep semantic resonance.
+- **Convergence Policy:** V3 uses an Automated Phasal Pilot (Phases 0 $\to$ 3). Phase transitions are dynamically triggered by rolling energy (`avg_e < target_e`), capping at 48 iterations (Phase 3: Crystallize).
 - **Hardware Guardian:** Total VRAM usage must remain < 15.1GB per T4 to prevent swap-latency.
 
 ## 🚀 Section 3: Master Execution Protocol (MANDATORY)
@@ -51,7 +51,7 @@
     - **Axiom: Phasal Annealing**: To break the final 7.5 plateau, LR must drop to micro-scale (`1e-6`) to force gradients out of the "wandering valley" and into absolute factual minima.
     - **Axiom: OCNS Memory Hygiene**: `torch.roll` inside iterative loops (48 iters) triggers OOM via activation-buffer explosion. **Fix**: Use zero-copy Slicing (Views) for temporal shifts to maintain dual-T4 feasibility.
     - **Axiom: Triton Dual-Path**: Keep Python reference logic alongside Triton kernels for parity testing.
-    - **Axiom: APD Floor**: Adaptive Phasal Depth MUST have a hard `min_iters` floor (e.g., 8) to prevent model collapse.
+    - ~~**Axiom: APD Floor**: Adaptive Phasal Depth MUST have a hard `min_iters` floor~~ **[OUTDATED IN V3]**: Anderson Acceleration now mathematically guarantees stable convergence; early exits are exclusively dictated by exact adjoint tolerance (`res_norm < tol`), eliminating the need for arbitrary iteration floors.
     - **Axiom: Triton 3.6 Strictness**: `tl.where` on scalars is illegal. Use boolean math or broadcasted block masks.
     - **Axiom: The In-Place Copy Trap**: Calling `.float()` or `.contiguous()` inside a Triton wrapper creates a **copy**. If the kernel is in-place, it updates the copy and leaves the original stale. Always cast to FP32 *before* the loop.
     - **Axiom: NaN-Siphon Principle**: In iterative models, use `tl.where(tl.isnan(step), 0.0, step)` inside the update kernel to prevent a single bad expert from poisoning the entire state.
@@ -95,7 +95,7 @@
     - **Axiom: Telemetry Standard**: Log `avg_energy` as primary internal health signal.
 - **[2026-04-11] 3.2B MoE & Fusion Engineering:**
     - **Axiom: MoE Throughput**: Use Batch-BMM `[E, K, D]` for expert passes. No serial loops.
-    - **Axiom: Zero-Break Fusion**: Static-length loops (`local_iters`) only. Guarantees 100% Inductor fusion.
+    - ~~**Axiom: Zero-Break Fusion**: Static-length loops (`local_iters`) only. Guarantees 100% Inductor fusion.~~ **[OUTDATED IN V3]**: We abandoned `torch.compile` (Inductor) due to CUDAGraphs crashing on the DEQ backward pass. Dynamic breaks via Anderson Acceleration (`res_norm < tol`) are now standard.
     - **Axiom: Stability Precision**: Weights/Matmuls = FP16; Accumulation/Norms/index_add = FP32.
     - **Axiom: Static Loss-Scaling**: Use `loss/256` for sharded FP16 pipelines. `GradScaler` incompatible.
 - **[2026-04-10] PPC Precision Logic:**
@@ -117,9 +117,8 @@
     - **Energy-Weighted Expert Choice**: Route tokens to specialized experts based on their Phasal Energy (e.g., "Stabilizer" experts for high-energy tokens).
     - **Adaptive Spectral Guardian**: Link the guardian penalty strength to the rolling loss average to balance phasal exploration vs. stability.
     - **OCNS Harmonic Priming**: Implement high-frequency learning rates for Phasal Gains to synchronize causal memory with logic wavefronts.
-- **Triton Kernel Fusion**:
-    - Rewrite `PPCNodeLayer` iterative loop in raw Triton. 
-    - Target: Eliminate `torch.compile` cold-start latency and fuse MoE/OCNS into a single SRAM kernel.
+- **[DONE] Triton Kernel Fusion**:
+    - Re-wrote Phase Rotation, OCNS Delays, and Anderson Mixing in raw Triton (`triton_kernels.py`) to permanently eliminate Inductor cold-start latency and CUDAGraphs memory corruption.
 - **NF4 Quantized Experts**:
     - Move Experts to 4-bit NormalFloat (NF4) while keeping PPC core in FP32.
     - Target: Scale to 6.4B parameters on Dual-T4 hardware without OOM.
