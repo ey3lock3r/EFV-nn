@@ -255,7 +255,7 @@ def _anderson_mixing_kernel(
     B: tl.constexpr, N: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
     pid = tl.program_id(0).to(tl.int64)
-    b   = pid / ((N + BLOCK_N - 1) // BLOCK_N)
+    b   = pid // ((N + BLOCK_N - 1) // BLOCK_N)
     off = (pid % ((N + BLOCK_N - 1) // BLOCK_N)) * BLOCK_N
     
     n_off = off + tl.arange(0, BLOCK_N)
