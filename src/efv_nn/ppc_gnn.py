@@ -115,9 +115,6 @@ class PPCNodeLayer(nn.Module):
             B, T, D, _ = x_stream.shape
             iters_run = 0
 
-            # PERFORMANCE: Cache contiguous MoE weights OUTSIDE no_grad so gradients flow naturally
-            self.moe.cache_weights()
-
             # Pillar 1: Compute Spectral Routing Bias once per layer
             gate_bias = self.spectral_gate(x_stream) if hasattr(self, 'spectral_gate') else None
 
@@ -170,12 +167,8 @@ class PPCNodeLayer(nn.Module):
             layer_params = [p for p in self.parameters() if p.requires_grad]
             
             out, iters_run, res_norm = DEQFunction.apply(
-                x_stream, f_solver, f_forward_step, gate_bias, x_target, self.moe.clear_cache, *layer_params
+                x_stream, f_solver, f_forward_step, gate_bias, x_target, self.moe.cache_weights, self.moe.clear_cache, *layer_params
             )
-
-            # Fix inference memory leak: Clear the FP32 cache manually if gradient is disabled
-            if not torch.is_grad_enabled():
-                self.moe.clear_cache()
 
         if unbatched:
             out = out.squeeze(0)

@@ -94,11 +94,15 @@ def anderson_acceleration(f: Callable, x0: torch.Tensor, m: int = 5, lam: float 
 
 class DEQFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x_in, f_solver, f_forward, gate_bias, target, cleanup_fn, *params):
+    def forward(ctx, x_in, f_solver, f_forward, gate_bias, target, setup_fn, cleanup_fn, *params):
+        if setup_fn is not None: setup_fn()
         with torch.no_grad():
             z_star, iters, res_norm = f_solver(x_in, gate_bias, target)
+        if cleanup_fn is not None: cleanup_fn()
+        
         ctx.save_for_backward(z_star.detach(), x_in, gate_bias, target, *params)
         ctx.f_forward = f_forward
+        ctx.setup_fn = setup_fn
         ctx.cleanup_fn = cleanup_fn
         return z_star.detach(), torch.tensor(float(iters), device=x_in.device), res_norm
 
@@ -107,38 +111,34 @@ class DEQFunction(torch.autograd.Function):
         z_star, x_in, gate_bias, target, *params = ctx.saved_tensors
         f_forward = ctx.f_forward
 
+        if hasattr(ctx, 'setup_fn') and ctx.setup_fn is not None:
+            ctx.setup_fn()
+
         # 1. Solve (I - J^T) g = grad_output
-        # We solve the fixed point g = grad_output + J^T g
-        # where J^T g is the Vector-Jacobian Product (VJP)
         with torch.enable_grad():
             z_star_leaf = z_star.detach().requires_grad_(True)
             z_next = f_forward(z_star_leaf, x_in, gate_bias, target)
 
         def backward_f(g_curr):
-            # VJP: J^T g_curr
             vjp = torch.autograd.grad(z_next, z_star_leaf, grad_outputs=g_curr, retain_graph=True)[0]
             return grad_output + vjp
 
-        # Use Anderson Acceleration for the exact IFT backward pass
         g, _, _ = anderson_acceleration(backward_f, grad_output, m=5, max_iter=15, tol=1e-5)
 
-        # 2. Compute final gradients for parameters and inputs using the converged g
         grad_targets = []
         target_indices = []
         if ctx.needs_input_grad[0]: grad_targets.append(x_in); target_indices.append(0)
         if ctx.needs_input_grad[3]: grad_targets.append(gate_bias); target_indices.append(3)
         if ctx.needs_input_grad[4]: grad_targets.append(target); target_indices.append(4)
         
-        param_start_idx = 6
+        param_start_idx = 7 # shifted by 1 because of setup_fn
         for i, p in enumerate(params):
             if ctx.needs_input_grad[param_start_idx + i]:
                 grad_targets.append(p)
                 target_indices.append(param_start_idx + i)
         
-        # Compute gradients with respect to parameters using the 'corrected' adjoint g
         grads = torch.autograd.grad(z_next, grad_targets, grad_outputs=g, retain_graph=True, allow_unused=True)
         
-        # Cleanup memory (e.g., clear MoE cache) after the backward pass is done
         if hasattr(ctx, 'cleanup_fn') and ctx.cleanup_fn is not None:
             ctx.cleanup_fn()
 
