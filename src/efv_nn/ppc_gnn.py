@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from efv_nn import ppc_core
 from efv_nn.ppc_core import SpectralExpertGate
 from efv_nn.deq_solvers import anderson_acceleration, DEQFunction
+from efv_nn import diagnostics
 
 # Optimization: Import Triton kernels as module to allow dynamic reloads
 try:
@@ -133,10 +134,10 @@ class PPCNodeLayer(nn.Module):
                 )
                 x_target = _tmp_target.clone() if torch.is_grad_enabled() else _tmp_target
                 
-                if torch.isnan(x_target).any():
-                    print("!!! [DEBUG] x_target NaN in PPCNodeLayer !!!")
-                if gate_bias is not None and torch.isnan(gate_bias).any():
-                    print("!!! [DEBUG] gate_bias NaN in PPCNodeLayer !!!")
+                diagnostics.debug_print_nan(x_target, "PPCNodeLayer.x_target")
+                if gate_bias is not None:
+                    diagnostics.debug_print_nan(gate_bias, "PPCNodeLayer.gate_bias")
+
 
             else:
                 x_prev = x_stream[:, :-1, :, :]

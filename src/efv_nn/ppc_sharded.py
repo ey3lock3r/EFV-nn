@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from efv_nn import diagnostics
 from torch.utils.checkpoint import checkpoint
 import bitsandbytes.nn as bnb_nn
 from efv_nn import ppc_gnn, ppc_core
@@ -66,9 +67,7 @@ class ShardedPPCGraphLLM(nn.Module):
             # Checkpointing is removed: We have 14GB free VRAM per T4. 
             x, iters, res_norm = layer(x, local_iters)
             
-            if torch.isnan(x).any():
-                print(f"!!! NaN DETECTED in Layer {i} Output !!!")
-                print(f"Layer {i} iters: {iters}, res_norm: {res_norm.item() if hasattr(res_norm, 'item') else res_norm}")
+            diagnostics.debug_print_nan(x, f"Layer {i} Output")
 
             x = x.clone() # Isolation: Prevent CUDA Graph buffer overwrite in loops
             total_iters += iters.item()
@@ -78,8 +77,7 @@ class ShardedPPCGraphLLM(nn.Module):
         layer_energies = torch.stack([e.to(self.device1) for e in res_energies])
         avg_energy = layer_energies.mean()
         
-        if torch.isnan(avg_energy):
-            print(f"!!! NaN avg_energy detected: {layer_energies}")
+        diagnostics.debug_print_nan(avg_energy, "avg_energy")
 
         # Final decoding on device1
         x_flat = x.flatten(-2) # [..., 2D]

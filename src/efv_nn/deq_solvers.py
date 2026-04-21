@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from typing import Callable, Tuple
+from efv_nn import diagnostics
 
 try:
     from . import triton_kernels
@@ -61,12 +62,13 @@ def anderson_acceleration(f: Callable, x0: torch.Tensor, m: int = 5, lam: float 
         except torch._C._LinAlgError:
             alpha = torch.zeros(B, m_k, dtype=x.dtype, device=x.device)
             
-        if torch.isnan(alpha).any() or torch.isinf(alpha).any():
-            print(f"!!! [DEBUG] alpha NaN/Inf at iter {k} !!!")
+        if diagnostics.debug_print_nan(alpha, f"anderson.alpha_{k}"):
+            alpha = torch.zeros(B, m_k, dtype=x.dtype, device=x.device)
+        elif torch.isinf(alpha).any():
+            print(f"!!! [DEBUG] alpha Inf at iter {k} !!!")
             alpha = torch.zeros(B, m_k, dtype=x.dtype, device=x.device)
             
-        if torch.isnan(res_norm):
-            print(f"!!! [DEBUG] res_norm NaN at iter {k} !!!")
+        diagnostics.debug_print_nan(res_norm, f"anderson.res_norm_{k}")
             
         # --- Update History ---
         buf_idx = k % m
