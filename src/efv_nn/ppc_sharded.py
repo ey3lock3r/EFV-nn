@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import os
 from efv_nn import diagnostics
 from torch.utils.checkpoint import checkpoint
 import bitsandbytes.nn as bnb_nn
@@ -69,10 +70,20 @@ class ShardedPPCGraphLLM(nn.Module):
         total_iters = 0
         res_energies = []
         for i, layer in enumerate(self.layers):
-            if i == self.split_point:
-                x = x.to(self.device1)
+            if i >= self.split_point:
+                target_device = self.device1
+            else:
+                target_device = self.device0
+            
+            if x.device.type != 'cpu' and str(x.device) != target_device:
+                x = x.to(target_device)
+            
+            # Heavy-Duty Device Guard: Ensure the layer hasn't migrated
+            # We check the first parameter's device.
+            first_param = next(layer.parameters())
+            if str(first_param.device) != target_device:
+                layer.to(target_device)
 
-            # Checkpointing is removed: We have 14GB free VRAM per T4. 
             x, iters, res_norm = layer(x, local_iters)
             
             diagnostics.debug_print_nan(x, f"Layer {i} Output")
