@@ -61,11 +61,6 @@ class ShardedPPCGraphLLM(nn.Module):
         input_ids = input_ids.to(self.device0)
         x = self.embed(input_ids) # [B, T, D, 2]
 
-        if os.environ.get("PPC_DEBUG") == "1":
-            print(f"DEBUG: Layer 0 Device: {next(self.layers[0].parameters()).device}")
-            print(f"DEBUG: Layer 13 Device: {next(self.layers[13].parameters()).device}")
-            print(f"DEBUG: Layer 13 Gate Device: {self.layers[13].spectral_gate.low_freq_proj.weight.device}")
-            print(f"DEBUG: Input x Device: {x.device}")
 
         total_iters = 0
         res_energies = []
