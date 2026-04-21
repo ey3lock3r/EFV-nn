@@ -53,20 +53,22 @@ def anderson_acceleration(f: Callable, x0: torch.Tensor, m: int = 5, lam: float 
             G_hist = F[:, idx] - X[:, idx]
             dG[:, :, i] = res_k - G_hist
             
-        dG_T = dG.transpose(1, 2)
-        A = torch.bmm(dG_T, dG) + lam * torch.eye(m_k, dtype=x.dtype, device=x.device).unsqueeze(0)
+        # Regularization: 1e-3 is safer than 1e-4 for initial phasal resonance
+        lam_stable = lam * 10 if k < 5 else lam
+        A = torch.bmm(dG_T, dG) + lam_stable * torch.eye(m_k, dtype=x.dtype, device=x.device).unsqueeze(0)
         b = torch.bmm(dG_T, res_k.unsqueeze(-1))
         
         try:
-            alpha = torch.linalg.solve(A, b).squeeze(-1) # [B, m_k]
+            # solve is more stable in FP32
+            alpha = torch.linalg.solve(A.float(), b.float()).to(x.dtype).squeeze(-1) # [B, m_k]
         except torch._C._LinAlgError:
             alpha = torch.zeros(B, m_k, dtype=x.dtype, device=x.device)
             
         if diagnostics.debug_print_nan(alpha, f"anderson.alpha_{k}"):
             alpha = torch.zeros(B, m_k, dtype=x.dtype, device=x.device)
-        elif torch.isinf(alpha).any():
-            print(f"!!! [DEBUG] alpha Inf at iter {k} !!!")
-            alpha = torch.zeros(B, m_k, dtype=x.dtype, device=x.device)
+        
+        # Alpha Clipping: Prevent extreme jumps in the state space
+        alpha = torch.clamp(alpha, -1.0, 1.0)
             
         diagnostics.debug_print_nan(res_norm, f"anderson.res_norm_{k}")
             

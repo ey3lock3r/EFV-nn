@@ -158,7 +158,13 @@ class PPCNodeLayer(nn.Module):
                 B_in, T_in, D_in, _ = x_eff.shape
                 pred, _, _, _ = self.moe(x_eff.reshape(B_in * T_in, D_in, 2), gate_bias=g_bias)
                 pred = pred.float().reshape(B_in, T_in, D_in, 2)
-                return x + self.base_local_lr * (target - pred)
+                
+                # Pillar 6: Contractive Residual. 
+                # We clip the update to ensure the state remains within a stable basin.
+                update = self.base_local_lr * (target - pred)
+                update = torch.clamp(update, -10.0, 10.0) 
+                
+                return x + update
 
             def f_solver(x_init, g_bias, target):
                 exit_thr_sq = self.exit_threshold.item() ** 2
