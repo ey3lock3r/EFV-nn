@@ -132,6 +132,11 @@ class PPCNodeLayer(nn.Module):
                     x_stream, self.cos_p, self.sin_p, out=self._target_buf
                 )
                 x_target = _tmp_target.clone() if torch.is_grad_enabled() else _tmp_target
+                
+                if torch.isnan(x_target).any():
+                    print("!!! [DEBUG] x_target NaN in PPCNodeLayer !!!")
+                if gate_bias is not None and torch.isnan(gate_bias).any():
+                    print("!!! [DEBUG] gate_bias NaN in PPCNodeLayer !!!")
 
             else:
                 x_prev = x_stream[:, :-1, :, :]
