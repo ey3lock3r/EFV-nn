@@ -138,7 +138,7 @@ class DEQFunction(torch.autograd.Function):
                 
             return grad_output + vjp
 
-        g, _, _ = anderson_acceleration(backward_f, grad_output, m=5, max_iter=15, tol=1e-5)
+        g, _, _ = anderson_acceleration(backward_f, grad_output, m=5, max_iter=8, tol=1e-5)
         
         # Adjoint Safety Check
         if torch.isnan(g).any():
