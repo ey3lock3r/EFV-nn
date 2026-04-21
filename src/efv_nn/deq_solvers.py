@@ -130,9 +130,19 @@ class DEQFunction(torch.autograd.Function):
 
         def backward_f(g_curr):
             vjp = torch.autograd.grad(z_next, z_star_leaf, grad_outputs=g_curr, retain_graph=True)[0]
+            
+            # Adjoint Normalization: If the VJP explodes, we dampen it.
+            vjp_norm = torch.linalg.norm(vjp)
+            if vjp_norm > 100.0:
+                vjp = vjp * (100.0 / vjp_norm)
+                
             return grad_output + vjp
 
         g, _, _ = anderson_acceleration(backward_f, grad_output, m=5, max_iter=15, tol=1e-5)
+        
+        # Adjoint Safety Check
+        if torch.isnan(g).any():
+            g = grad_output
 
         grad_targets = []
         target_indices = []
