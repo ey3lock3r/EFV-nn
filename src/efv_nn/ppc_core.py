@@ -220,13 +220,13 @@ class SpectralExpertGate(nn.Module):
     """
     Conditions MoE expert selection on the spectral density of the hidden state.
     """
-    def __init__(self, hidden_dim: int, num_experts: int):
+    def __init__(self, hidden_dim: int, num_experts: int, device=None, dtype=torch.float32):
         super().__init__()
         self.num_experts = num_experts
         spectral_feat_dim = hidden_dim
-        self.low_freq_proj  = nn.Linear(spectral_feat_dim, num_experts, bias=False)
-        self.high_freq_proj = nn.Linear(spectral_feat_dim, num_experts, bias=False)
-        self.spectral_blend = nn.Parameter(torch.tensor(0.0))
+        self.low_freq_proj  = nn.Linear(spectral_feat_dim, num_experts, bias=False, device=device, dtype=dtype)
+        self.high_freq_proj = nn.Linear(spectral_feat_dim, num_experts, bias=False, device=device, dtype=dtype)
+        self.spectral_blend = nn.Parameter(torch.tensor(0.0, device=device, dtype=dtype))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, D, _ = x.shape

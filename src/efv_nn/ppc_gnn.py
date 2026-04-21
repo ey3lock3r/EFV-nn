@@ -48,23 +48,23 @@ class PPCNodeLayer(nn.Module):
 
         # Adaptive Phasal Depth (APD): Learnable exit threshold with hard floor guard.
         # APD: Adaptive Phasal Depth threshold (0.000001 = 0.0001% phasal resonance error)
-        self.exit_threshold = nn.Parameter(torch.tensor(0.000001))
+        self.exit_threshold = nn.Parameter(torch.tensor(0.000001, device=device, dtype=dtype))
 
         # OCNS Integration: Phasal Delay Embedding Gains
         self.prime_delays = list(prime_delays) if prime_delays else []
         if self.prime_delays:
             # Shape: [num_delays, hidden_dim, 2] - allows complex scaling and phase rotation
-            self.delay_gains = nn.Parameter(torch.zeros(len(self.prime_delays), hidden_dim, 2))
+            self.delay_gains = nn.Parameter(torch.zeros(len(self.prime_delays), hidden_dim, 2, device=device, dtype=dtype))
 
         # Phase rotation parameters: store as cos/sin for manual rotation
-        phase = torch.rand(hidden_dim) * 2 * math.pi
+        phase = torch.rand(hidden_dim, device=device) * 2 * math.pi
         self.register_buffer('cos_p', torch.cos(phase))
         self.register_buffer('sin_p', torch.sin(phase))
 
         # Check for Triton availability (used in forward)
         self._triton_available = TRITON_AVAILABLE and use_triton and torch.cuda.is_available()
 
-        self.spectral_gate = SpectralExpertGate(hidden_dim, num_experts)
+        self.spectral_gate = SpectralExpertGate(hidden_dim, num_experts, device=device, dtype=dtype)
         # We determine the target device to avoid RAM spikes during initialization
         self.moe = ExpertChoiceMoEMatcher(
             hidden_dim, num_experts=num_experts, 
