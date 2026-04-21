@@ -3,7 +3,7 @@ import torch.nn as nn
 import math
 import torch.nn.functional as F
 from efv_nn import ppc_core
-from efv_nn.ppc_core import SpectralExpertGate
+from efv_nn.ppc_core import SpectralExpertGate, ExpertChoiceMoEMatcher
 from efv_nn.deq_solvers import anderson_acceleration, DEQFunction
 from efv_nn import diagnostics
 
