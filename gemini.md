@@ -39,6 +39,13 @@
 ---
 
 ## 4. Learnings & Mistakes Diary (High-Density)
+- **[2026-04-21] PPC-GNN V3 Validation & System Hardening:**
+    - **Axiom: ComplexGELU over ModReLU**: Activating real and imaginary parts independently (ComplexGELU) natively respects Wirtinger calculus, unlocking stable non-linear phase mixing without destroying the implicit backward pass.
+    - **Axiom: DEQ Ghost-Cache Accumulation (The 25GB Leak)**: Caching MoE FP32 weights before a DEQ layer and clearing them in the backward pass causes massive VRAM leakage across layers during the forward pass (e.g., $12 \times 2.14GB = 25.7GB$). **Fix**: Pass `setup_fn` and `cleanup_fn` directly into `DEQFunction` to restrict MoE caching strictly to the active micro-iterations.
+    - **Axiom: Triton Pythonic Type-Coercion Trap**: In Python 3, `pid / N` silently coerces to `float32`. Triton strictly throws `IncompatibleTypeErrorImpl` when this float touches memory pointers. **Fix**: Always use floor division `//` for Triton index grids.
+    - **Axiom: PagedAdamW Multi-GPU Resurrection**: When loading a `bitsandbytes` optimizer from a CPU checkpoint (`map_location='cpu'`), native `load_state_dict()` leaves momentum tensors on the CPU. **Fix**: Explicitly loop through `opt.state` and map each tensor to its specific `param.device` to prevent multi-GPU crashes.
+    - **Axiom: NVMe Memory-Mapped Checkpoints**: Loading a 6.4GB model via `torch.load()` causes a 6.4GB RAM spike. **Fix**: Using `mmap=True` streams the checkpoint directly from disk to GPU via PCIe, bypassing system RAM entirely.
+    - **Mistake: Adam Momentum Disconnection**: Re-initializing the optimizer (`get_opt()`) during scheduled phase-transitions wipes all momentum/variance history, causing violent trajectory spikes. **Fix**: Traverse and update `pg['lr']` directly within the existing `param_groups`.
 - **[2026-04-18] The 20,000-Step Milestone (Phase 6):**
     - **Axiom: Syntactic Mastery**: At 10M tokens (Step 20k), 3.2B PPC-GNN achieves perfect syntax (punctuation/preposition clustering) without semantic coherence. Loss floor breached at `7.39`.
     - **Axiom: Phasal Annealing**: To break the final 7.5 plateau, LR must drop to micro-scale (`1e-6`) to force gradients out of the "wandering valley" and into absolute factual minima.
