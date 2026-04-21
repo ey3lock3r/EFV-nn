@@ -21,15 +21,15 @@ def anderson_acceleration(f: Callable, x0: torch.Tensor, m: int = 5, lam: float 
     X = torch.zeros(B, m, N, dtype=x.dtype, device=x.device)
     F = torch.zeros(B, m, N, dtype=x.dtype, device=x.device)
     
-    x_flat = x.view(B, -1)
+    x_flat = x.reshape(B, -1)
     f_x = f(x)
-    f_x_flat = f_x.view(B, -1)
+    f_x_flat = f_x.reshape(B, -1)
     
     X[:, 0] = x_flat
     F[:, 0] = f_x_flat
     
     x = f_x
-    x_flat = x.view(B, -1)
+    x_flat = x.reshape(B, -1)
     
     iters_run = 1
     res_norm = torch.norm(f_x_flat - X[:, 0], dim=-1).mean()
@@ -37,7 +37,7 @@ def anderson_acceleration(f: Callable, x0: torch.Tensor, m: int = 5, lam: float 
     for k in range(1, max_iter):
         iters_run += 1
         f_x = f(x)
-        f_x_flat = f_x.view(B, -1)
+        f_x_flat = f_x.reshape(B, -1)
         
         res_k = f_x_flat - x_flat
         res_norm = torch.norm(res_k, dim=-1).mean()
@@ -87,7 +87,7 @@ def anderson_acceleration(f: Callable, x0: torch.Tensor, m: int = 5, lam: float 
                 x_next_flat -= alpha[:, i:i+1] * (f_x_flat - F[:, idx])
         
         x_flat = x_next_flat
-        x = x_flat.view(B, T, D, 2)
+        x = x_flat.reshape(B, T, D, 2)
         
     return x, iters_run, res_norm
 
