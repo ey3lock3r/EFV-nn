@@ -35,6 +35,7 @@ def anderson_acceleration(f: Callable, x0: torch.Tensor, m: int = 5, lam: float 
     iters_run = 1
     res_norm = torch.norm(f_x_flat - X[:, 0], dim=-1).mean()
     
+    dG = torch.zeros(B, N, m, dtype=x.dtype, device=x.device)
     for k in range(1, max_iter):
         iters_run += 1
         f_x = f(x)
@@ -46,8 +47,7 @@ def anderson_acceleration(f: Callable, x0: torch.Tensor, m: int = 5, lam: float 
             break
             
         m_k = min(k, m)
-        dG = torch.zeros(B, N, m_k, dtype=x.dtype, device=x.device)
-        
+        # Update dG in-place for current history window
         for i in range(m_k):
             idx = (k - 1 - i) % m
             G_hist = F[:, idx] - X[:, idx]
@@ -55,8 +55,9 @@ def anderson_acceleration(f: Callable, x0: torch.Tensor, m: int = 5, lam: float 
             
         # Regularization: 1e-3 is safer than 1e-4 for initial phasal resonance
         lam_stable = lam * 10 if k < 5 else lam
-        dG_T = dG.transpose(1, 2)
-        A = torch.bmm(dG_T, dG) + lam_stable * torch.eye(m_k, dtype=x.dtype, device=x.device).unsqueeze(0)
+        dG_curr = dG[:, :, :m_k]
+        dG_T = dG_curr.transpose(1, 2)
+        A = torch.bmm(dG_T, dG_curr) + lam_stable * torch.eye(m_k, dtype=x.dtype, device=x.device).unsqueeze(0)
         b = torch.bmm(dG_T, res_k.unsqueeze(-1))
         
         try:

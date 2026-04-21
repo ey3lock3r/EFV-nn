@@ -80,8 +80,8 @@ class ShardedPPCGraphLLM(nn.Module):
                 layer.to(target_device)
 
             x, iters, res_norm = layer(x, local_iters)
-            
-            diagnostics.debug_print_nan(x, f"Layer {i} Output")
+            if os.environ.get("PPC_DEBUG") == "1" and i == 0:
+                print(f"DEBUG: Layer 0 Forward Iters: {iters}")
 
             x = x.clone() # Isolation: Prevent CUDA Graph buffer overwrite in loops
             total_iters += iters.item()
