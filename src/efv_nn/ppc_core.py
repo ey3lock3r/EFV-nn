@@ -10,20 +10,40 @@ class ComplexKaimingInitializer:
     """
 
     @staticmethod
-    def initialize(shape: tuple, gain: float = 1.0) -> torch.Tensor:
+    def initialize(shape: tuple, gain: float = 1.0, device='cpu', dtype=torch.float32) -> torch.Tensor:
+        """
+        Memory-efficient initialization using in-place operations to prevent 
+        RAM spikes on large-parameter models (3.2B+).
+        """
         if len(shape) > 1:
             fan_in = shape[-1] if len(shape) == 1 else shape[-2]
         else:
             fan_in = 1
 
         scale = gain / math.sqrt(fan_in)
-        magnitude = torch.abs(torch.randn(shape)) * scale
-        phase = torch.rand(shape) * 2 * math.pi
         
-        # Interleaved real: [magnitude*cos(phase), magnitude*sin(phase)]
-        real = magnitude * torch.cos(phase)
-        imag = magnitude * torch.sin(phase)
-        return torch.stack([real, imag], dim=-1)
+        # Pre-allocate the final interleaved-real tensor [..., 2]
+        # This saves us from creating separate 'real' and 'imag' temporary tensors.
+        out = torch.empty((*shape, 2), device=device, dtype=dtype)
+        
+        # 1. Compute Phase in-place in the second channel
+        # Use out[..., 1] as temporary storage for phase
+        phase = out[..., 1].uniform_(0, 2 * math.pi)
+        
+        # 2. Compute Magnitude in-place in the first channel
+        mag = out[..., 0].normal_(0, 1).abs_().mul_(scale)
+        
+        # 3. Transform to Complex (In-place)
+        # Final Real: mag * cos(phase)
+        # Final Imag: mag * sin(phase)
+        # We must copy phase/mag because we are about to overwrite them
+        p_tmp = phase.clone()
+        m_tmp = mag.clone()
+        
+        out[..., 0] = m_tmp * torch.cos(p_tmp)
+        out[..., 1] = m_tmp * torch.sin(p_tmp)
+        
+        return out
 
 
 # Keep the old name as an alias so existing callers are not broken.
@@ -60,19 +80,26 @@ def complex_activation(x: torch.Tensor) -> torch.Tensor:
     return torch.stack([real, imag], dim=-1)
 
 class ExpertChoiceMoEMatcher(nn.Module):
-    def __init__(self, hidden_dim, num_experts=16, k_nodes=None):
+    def __init__(self, hidden_dim: int, num_experts: int = 64, k_nodes: int = 2, 
+                 device=None, dtype=torch.float32):
         super().__init__()
-        self.hidden_dim, self.num_experts = hidden_dim, num_experts
+        self.num_experts = num_experts
         self.k_nodes_default = k_nodes
-        # Gate weights: [2*hidden_dim, num_experts] - gate remains real-valued
-        self.gate_weights = nn.Parameter(
-            torch.randn(hidden_dim * 2, num_experts) / math.sqrt(hidden_dim * 2)
-        )
+        self.hidden_dim = hidden_dim
 
-        # Experts stored in interleaved real [num_experts, hidden_dim, hidden_dim, 2]
-        # Using half precision for storage, unpacking to float32 for matmul
-        init_real = ComplexKaimingInitializer.initialize((num_experts, hidden_dim, hidden_dim))
-        self.experts_weight_real = nn.Parameter(init_real.half())
+        # 1. Routing Gate (Interleaved)
+        self.gate_weights = nn.Parameter(
+            torch.empty(hidden_dim * 2, num_experts, device=device, dtype=dtype)
+        )
+        nn.init.orthogonal_(self.gate_weights, gain=0.1)
+
+        # 2. Experts (Interleaved Real: [E, D, D, 2])
+        # Use our memory-efficient complex initializer
+        init_w = ComplexKaimingInitializer.initialize(
+            (num_experts, hidden_dim, hidden_dim), 
+            gain=1.0, device=device, dtype=dtype
+        )
+        self.experts_weight_real = nn.Parameter(init_w)
 
         self.activation = ComplexGELU(hidden_dim)
 

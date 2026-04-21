@@ -35,8 +35,10 @@ class ShardedPPCGraphLLM(nn.Module):
             layer = ppc_gnn.PPCNodeLayer(
                 hidden_dim, num_experts=num_experts, local_lr=local_lr,
                 lr_decay=lr_decay, use_jacobian=use_jacobian,
-                prime_delays=prime_delays, use_triton=use_triton
-            ).to(target_device)
+                prime_delays=prime_delays, use_triton=use_triton,
+                device=target_device
+            )
+            self.layers.append(layer)
 
             # Triton kernels are pre-compiled on first call — no cold start needed.
             # CUDAGraphs Exorcism: We do not use torch.compile as it corrupts memory pools

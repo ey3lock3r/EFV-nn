@@ -34,8 +34,10 @@ def spectral_guardian_penalty(layer_energies: torch.Tensor, lam: float = 0.01) -
 
 
 class PPCNodeLayer(nn.Module):
-    def __init__(self, hidden_dim, num_experts=4, local_lr=0.5, lr_decay=0.85, tolerance=1e-3,
-                 use_jacobian=False, prime_delays=(1, 2, 3, 5), use_triton=True, min_iters=8):
+    def __init__(self, hidden_dim: int, num_experts: int = 64, local_lr: float = 0.5,
+                 lr_decay: float = 0.8, use_jacobian: bool = False,
+                 prime_delays=(1, 2, 3, 5), use_triton: bool = True,
+                 device=None, dtype=torch.float32, tolerance=1e-3, min_iters=8):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.base_local_lr = max(0.0, min(0.99, local_lr))
@@ -63,7 +65,11 @@ class PPCNodeLayer(nn.Module):
         self._triton_available = TRITON_AVAILABLE and use_triton and torch.cuda.is_available()
 
         self.spectral_gate = SpectralExpertGate(hidden_dim, num_experts)
-        self.moe = ppc_core.ExpertChoiceMoEMatcher(hidden_dim, num_experts=num_experts)
+        # We determine the target device to avoid RAM spikes during initialization
+        self.moe = ExpertChoiceMoEMatcher(
+            hidden_dim, num_experts=num_experts, 
+            device=device, dtype=dtype
+        )
         # Pillar 5: Selective Compilation (REMOVED)
         # We previously compiled the MoE, but CUDAGraphs (used in reduce-overhead) 
         # corrupts the memory pool when switching between no_grad (loop) and grad (bridge).
