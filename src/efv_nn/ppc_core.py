@@ -160,7 +160,7 @@ class ExpertChoiceMoEMatcher(nn.Module):
             scores = scores + gate_bias.to(scores.dtype)
 
         topk_scores, topk_indices = torch.topk(scores, k_nodes, dim=0)  # [k_node, num_experts]
-        return topk_indices, topk_scores
+        return topk_indices.T.contiguous(), topk_scores.T.contiguous()
 
     def compute(self, x_batched, topk_indices, topk_scores, B_T):
         """Computes expert outputs from pre-gathered/pre-delayed token batches."""
