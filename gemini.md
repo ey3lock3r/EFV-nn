@@ -120,7 +120,7 @@
     - **APD Relaxation**: Implemented dynamic iteration tolerance based on `rolling_energy`. Verified **5x throughput boost** (10.0 $\to$ 2.0 iters) in high-energy Phase 0.
     - **Zero-G Guard**: Optimized `ShardedPPCGraphLLM` with device object caching, eliminating Python hot-loop overhead.
     - **Adjoint Warm-Start**: Deployed persistent `_adjoint_cache` in `PPCNodeLayer`. Initialized backward passes with the previous adjoint solution to reduce convergence time by ~50%.
-    - **NF4 Expert Quantization**: Migrated experts to `bitsandbytes` 4-bit NormalFloat (NF4). Reclaimed **~12GB VRAM**, enabling future scaling to 6.4B on Dual-T4.
+    - **FP16 Expert Sharding**: Pivoted from NF4 to FP16 for MoE experts to enable full gradient updates. With layer-sharding across Dual-T4s, the 3.2B model still fits comfortably (~3.2GB weights per GPU).
     - **Triton Fusion**: Implemented Fused MoE Aggregator (Atomic Reduction + GELU) and Fused Dispatch/Delay (OCNS history + Expert Gather) to eliminate intermediate allocations.
 
 ---

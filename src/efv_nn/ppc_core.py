@@ -112,21 +112,18 @@ class ExpertChoiceMoEMatcher(nn.Module):
             gain=1.0, device=device, dtype=dtype
         )
         
-        # NF4 Quantization: Store real and imaginary parts as separate 4-bit parameters
-        # to save VRAM on Dual-T4 architectures.
-        if _BNB_AVAILABLE and device is not None and "cuda" in str(device):
-            self.expert_real = bnb_nn.Params4bit(
-                init_w[..., 0].contiguous(), requires_grad=True, quant_type='nf4'
-            )
-            self.expert_imag = bnb_nn.Params4bit(
-                init_w[..., 1].contiguous(), requires_grad=True, quant_type='nf4'
-            )
-            # Remove the original parameter to save space
-            self.experts_weight_real = None 
-        else:
-            self.experts_weight_real = nn.Parameter(init_w)
+        # Training Stability Pivot: We use FP16 for experts. 
+        # Sharding handles the VRAM load, and FP16 allows full gradient updates 
+        # which NF4 (inference-only) does not support.
+        self.experts_weight_real = nn.Parameter(init_w.half())
             
         self.activation = ComplexGELU(hidden_dim, device=device, dtype=dtype)
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        """Handles loading into FP16 parameters."""
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
+                                      missing_keys, unexpected_keys, error_msgs)
 
     def cache_weights(self):
         """Pre-slice, align, and cast weights to FP32 to prevent allocation and quantization jitter in DEQ loops."""
