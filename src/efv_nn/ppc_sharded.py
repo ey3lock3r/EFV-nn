@@ -79,8 +79,6 @@ class ShardedPPCGraphLLM(nn.Module):
                 layer.to(target_device)
 
             x, iters, res_norm = layer(x, local_iters)
-            if os.environ.get("PPC_DEBUG") == "1":
-                print(f"DEBUG: Layer {i} Forward Iters: {iters}")
 
             x = x.clone() # Isolation: Prevent CUDA Graph buffer overwrite in loops
             total_iters += iters.item()
@@ -96,8 +94,6 @@ class ShardedPPCGraphLLM(nn.Module):
         x_flat = x.flatten(-2) # [..., 2D]
         x_norm = self.layer_norm(x_flat)
         logits = self.output_head(x_norm)
-        if os.environ.get("PPC_DEBUG") == "1":
-            print(f"DEBUG: total_iters={total_iters}, num_layers={self.num_layers}")
         return logits, total_iters / self.num_layers, avg_energy, layer_energies
 
     @torch.no_grad()
