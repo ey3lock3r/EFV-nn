@@ -44,7 +44,6 @@ class ShardedPPCGraphLLM(nn.Module):
             # Triton kernels are pre-compiled on first call — no cold start needed.
             # CUDAGraphs Exorcism: We do not use torch.compile as it corrupts memory pools
             # during dynamic DEQ loop execution.
-            self.layers.append(layer)
 
         # 3. Output Head (GPU 1)
         self.layer_norm = nn.LayerNorm(hidden_dim * 2).to(self.device1)
