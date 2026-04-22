@@ -97,6 +97,8 @@ class ShardedPPCGraphLLM(nn.Module):
         x_flat = x.flatten(-2) # [..., 2D]
         x_norm = self.layer_norm(x_flat)
         logits = self.output_head(x_norm)
+        if os.environ.get("PPC_DEBUG") == "1":
+            print(f"DEBUG: total_iters={total_iters}, num_layers={self.num_layers}")
         return logits, total_iters / self.num_layers, avg_energy, layer_energies
 
     @torch.no_grad()
