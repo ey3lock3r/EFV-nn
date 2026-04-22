@@ -34,7 +34,7 @@ def spectral_guardian_penalty(layer_energies: torch.Tensor, lam: float = 0.01) -
 
 
 class PPCNodeLayer(nn.Module):
-    def __init__(self, hidden_dim: int, num_experts: int = 64, local_lr: float = 0.5,
+    def __init__(self, hidden_dim: int, num_experts: int = 64, local_lr: float = 0.05,
                  lr_decay: float = 0.8, use_jacobian: bool = False,
                  prime_delays=(1, 2, 3, 5), use_triton: bool = True,
                  device=None, dtype=torch.float32, tolerance=1e-3, min_iters=8):
@@ -221,7 +221,7 @@ class PPCNodeLayer(nn.Module):
 
 class PPCGraphLLM(nn.Module):
     def __init__(self, vocab_size: int, hidden_dim: int, num_layers: int = 2,
-                 num_experts: int = 4, local_lr: float = 0.5, lr_decay: float = 0.85, use_jacobian: bool = False):
+                 num_experts: int = 4, local_lr: float = 0.05, lr_decay: float = 0.85, use_jacobian: bool = False):
         super().__init__()
         self.vocab_size = vocab_size
         self.hidden_dim = hidden_dim

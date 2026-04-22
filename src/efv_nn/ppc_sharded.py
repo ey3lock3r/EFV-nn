@@ -8,7 +8,7 @@ from efv_nn import ppc_gnn, ppc_core
 
 class ShardedPPCGraphLLM(nn.Module):
     def __init__(self, vocab_size: int, hidden_dim: int = 1024, num_layers: int = 24,
-                 num_experts: int = 64, local_lr: float = 0.5, lr_decay: float = 0.85,
+                 num_experts: int = 64, local_lr: float = 0.05, lr_decay: float = 0.85,
                  use_jacobian: bool = False, prime_delays=(1, 2, 3, 5), use_triton: bool = True):
         super().__init__()
         self.vocab_size = vocab_size
