@@ -172,8 +172,9 @@ def fused_state_update(x_states, step, current_lr):
 # ============================================================
 @triton.jit
 def _gelu_fast(x):
-    # Using tl.math for version compatibility
-    return 0.5 * x * (1.0 + tl.math.tanh(0.79788456 * (x + 0.044715 * x * x * x)))
+    # Surgical Sigmoid Fix: tanh(x) = 2*sigmoid(2x) - 1
+    # Consistent across all Triton versions.
+    return 0.5 * x * (2.0 * tl.sigmoid(1.59576912 * (x + 0.044715 * x * x * x)))
 
 @triton.jit
 def _normalize_activate_kernel(
@@ -194,9 +195,11 @@ def _normalize_activate_kernel(
     bias_r = tl.load(bias_ptr + d_off, mask=mask, other=0.0)
     bias_i = tl.load(bias_ptr + D + d_off, mask=mask, other=0.0)
 
-    # Use tl.math.abs for version compatibility
-    r = tl.where(tl.math.abs(r) > 1e18, 0.0, r)
-    i = tl.where(tl.math.abs(i) > 1e18, 0.0, i)
+    # Use tl.where for absolute value to maximize compatibility
+    abs_r = tl.where(r < 0, -r, r)
+    abs_i = tl.where(i < 0, -i, i)
+    r = tl.where(abs_r > 1e18, 0.0, r)
+    i = tl.where(abs_i > 1e18, 0.0, i)
 
     r_act = _gelu_fast(r + bias_r)
     i_act = _gelu_fast(i + bias_i)
@@ -389,8 +392,8 @@ def _spectral_gate_pool_kernel(
     stride_t = D * 2
     fr = tl.load(x_fft_ptr + base + t_off * stride_t,     mask=t_mask, other=0.0)
     fi = tl.load(x_fft_ptr + base + t_off * stride_t + 1, mask=t_mask, other=0.0)
-    # Use tl.math.sqrt for version compatibility
-    mag = tl.math.sqrt(fr * fr + fi * fi)
+    # Using tl.sqrt for maximum compatibility
+    mag = tl.sqrt(fr * fr + fi * fi)
     mid = T_half // 2
     low_mask = t_mask & (t_off < mid)
     high_mask = t_mask & (t_off >= mid)
