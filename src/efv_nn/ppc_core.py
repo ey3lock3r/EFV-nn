@@ -194,7 +194,7 @@ class ExpertChoiceMoEMatcher(nn.Module):
         # 5. Fused Aggregation
         if _TRITON_AVAILABLE and x_batched.is_cuda:
             res = triton_kernels.fused_moe_aggregator(
-                y_weighted, topk_indices, B_T, self.activation.bias.reshape(D, 1).repeat(1, 2)
+                y_weighted, topk_indices, B_T, self.activation.bias
             )
             counts_buf = torch.zeros((B_T, 1, 1), device=x_batched.device, dtype=torch.float32)
             counts_buf.index_add_(0, flat_indices, torch.ones((self.num_experts * k_nodes, 1, 1), device=x_batched.device))

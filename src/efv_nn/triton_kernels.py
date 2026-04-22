@@ -192,17 +192,16 @@ def _normalize_activate_kernel(
     r = tl.load(output_ptr + row + d_off * 2,     mask=mask, other=0.0) / count
     i = tl.load(output_ptr + row + d_off * 2 + 1, mask=mask, other=0.0) / count
 
-    bias_r = tl.load(bias_ptr + d_off, mask=mask, other=0.0)
-    bias_i = tl.load(bias_ptr + D + d_off, mask=mask, other=0.0)
-
+    bias_val = tl.load(bias_ptr + d_off, mask=mask, other=0.0)
+    
     # Use tl.where for absolute value to maximize compatibility
     abs_r = tl.where(r < 0, -r, r)
     abs_i = tl.where(i < 0, -i, i)
     r = tl.where(abs_r > 1e18, 0.0, r)
     i = tl.where(abs_i > 1e18, 0.0, i)
 
-    r_act = _gelu_fast(r + bias_r)
-    i_act = _gelu_fast(i + bias_i)
+    r_act = _gelu_fast(r + bias_val)
+    i_act = _gelu_fast(i + bias_val)
 
     tl.store(result_ptr + row + d_off * 2,     r_act, mask=mask)
     tl.store(result_ptr + row + d_off * 2 + 1, i_act, mask=mask)
