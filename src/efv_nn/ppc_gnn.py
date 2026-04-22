@@ -160,9 +160,12 @@ class PPCNodeLayer(nn.Module):
 
             # --- DEQ Callables ---
             def f_forward_step(x, x_init, g_bias, target):
-                if self._triton_available and self.prime_delays and not torch.is_grad_enabled():
-                    # Hyper-Drive Fusion: Combine delay and dispatch into one kernel
-                    # Note: We compute gating on the current state 'x'
+                B, T, D, _ = x.shape
+                # Hybrid Bridge: Use Triton for Forward Speed, PyTorch for Gradient Connectivity
+                use_triton_now = self._triton_available and not torch.is_grad_enabled()
+
+                if use_triton_now:
+                    # Pillar 5: Dynamic Routing + Dispatch (Triton Path)
                     topk_indices, topk_scores = self.moe.get_indices(x, gate_bias=g_bias)
                     x_batched = triton_kernels.fused_moe_dispatch_delay(
                         x, self.delay_gains, self.prime_delays, topk_indices
@@ -170,10 +173,11 @@ class PPCNodeLayer(nn.Module):
                     pred, _, _, _ = self.moe.compute(x_batched, topk_indices, topk_scores, B * T)
                     pred = pred.reshape(B, T, D, 2)
                 else:
-                    if self._triton_available and self.prime_delays and not torch.is_grad_enabled():
-                        x_eff = triton_kernels.fused_ocns_delay(x, self.delay_gains, self.prime_delays, out=self._eff_buf)
-                    else:
+                    # Pillar 5: Dynamic Routing + Dispatch (PyTorch Path - Reconnects Autograd)
+                    if self.prime_delays:
                         x_eff = self._apply_ocns_delays(x)
+                    else:
+                        x_eff = x
                     B_in, T_in, D_in, _ = x_eff.shape
                     pred, _, _, _ = self.moe(x_eff.reshape(B_in * T_in, D_in, 2), gate_bias=g_bias)
                     pred = pred.float().reshape(B_in, T_in, D_in, 2)
