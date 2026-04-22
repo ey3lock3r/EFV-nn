@@ -188,7 +188,7 @@ class ExpertChoiceMoEMatcher(nn.Module):
         y_all = torch.stack([yr, yi], dim=-1) # [E, k, D, 2]
 
         # 4. Score Weighting
-        weights = topk_scores.T.reshape(self.num_experts, k_nodes, 1, 1).to(y_all.dtype)
+        weights = topk_scores.reshape(self.num_experts, k_nodes, 1, 1).to(y_all.dtype)
         y_weighted = (y_all * weights).reshape(self.num_experts * k_nodes, D, 2)
         
         # 5. Fused Aggregation
@@ -221,10 +221,10 @@ class ExpertChoiceMoEMatcher(nn.Module):
     def transpose_forward(self, residual, topk_indices, topk_scores, counts):
         original_dtype = residual.dtype
         B_T, D, _ = residual.shape
-        k_nodes = topk_indices.shape[0]
+        num_experts, k_nodes = topk_indices.shape
 
-        flat_indices = topk_indices.T.reshape(-1)
-        res_batched = residual[flat_indices].view(self.num_experts, k_nodes, D, 2)
+        flat_indices = topk_indices.reshape(-1)
+        res_batched = residual[flat_indices].view(num_experts, k_nodes, D, 2)
 
         if hasattr(self, '_wr_t_f32') and self._wr_t_f32 is not None:
             yr, yi = res_batched[..., 0].float(), res_batched[..., 1].float()
