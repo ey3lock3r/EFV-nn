@@ -80,6 +80,8 @@ class PPCNodeLayer(nn.Module):
         self._eff_buf    = None
         self._final_buf  = None
         
+        # Adjoint Cache for Warm-Starting (IFT Pillar)
+        self.register_buffer('_adjoint_cache', torch.zeros(1))
     def _apply_ocns_delays(self, x_states):
         """Memory-Efficient Phasal Delay Embedding (OCNS)."""
         if not self.prime_delays:
@@ -104,9 +106,10 @@ class PPCNodeLayer(nn.Module):
             
         return x_eff
         
-    def forward(self, x_stream, local_iters=8, gate_bias=None):
+    def forward(self, x_stream, local_iters=8, gate_bias=None, rolling_energy=None):
         """
         x_stream: [B, T, hidden_dim, 2] interleaved real
+        rolling_energy: Optional scalar representing the current phasal resonance energy.
         """
         unbatched = x_stream.dim() == 3
         if unbatched:
@@ -158,12 +161,21 @@ class PPCNodeLayer(nn.Module):
             # --- DEQ Callables ---
             def f_forward_step(x, x_init, g_bias, target):
                 if self._triton_available and self.prime_delays and not torch.is_grad_enabled():
-                    x_eff = triton_kernels.fused_ocns_delay(x, self.delay_gains, self.prime_delays, out=self._eff_buf)
+                    # Hyper-Drive Fusion: Combine delay and dispatch into one kernel
+                    # Note: We compute gating on the current state 'x'
+                    topk_indices, topk_scores = self.moe.get_indices(x, gate_bias=g_bias)
+                    x_batched = triton_kernels.fused_moe_dispatch_delay(
+                        x, self.delay_gains, self.prime_delays, topk_indices
+                    )
+                    pred, _, _, _ = self.moe.compute(x_batched, topk_indices, topk_scores, B * T)
                 else:
-                    x_eff = self._apply_ocns_delays(x)
-                B_in, T_in, D_in, _ = x_eff.shape
-                pred, _, _, _ = self.moe(x_eff.reshape(B_in * T_in, D_in, 2), gate_bias=g_bias)
-                pred = pred.float().reshape(B_in, T_in, D_in, 2)
+                    if self._triton_available and self.prime_delays and not torch.is_grad_enabled():
+                        x_eff = triton_kernels.fused_ocns_delay(x, self.delay_gains, self.prime_delays, out=self._eff_buf)
+                    else:
+                        x_eff = self._apply_ocns_delays(x)
+                    B_in, T_in, D_in, _ = x_eff.shape
+                    pred, _, _, _ = self.moe(x_eff.reshape(B_in * T_in, D_in, 2), gate_bias=g_bias)
+                    pred = pred.float().reshape(B_in, T_in, D_in, 2)
                 
                 # Pillar 6: Contractive Residual. 
                 # We clip the update to ensure the state remains within a stable basin.
@@ -173,19 +185,31 @@ class PPCNodeLayer(nn.Module):
                 return x + update
 
             def f_solver(x_init, g_bias, target):
-                exit_thr_sq = self.exit_threshold.item() ** 2
+                # APD Relaxation: Dynamic tolerance allows early exit during high-energy phases (Phase 0)
+                base_tol_sq = self.exit_threshold.item() ** 2
+                if rolling_energy is not None:
+                    # 0.1 multiplier is conservative; 0.05 is standard for phasal locking
+                    dynamic_tol_sq = max(base_tol_sq, (rolling_energy * 0.05) ** 2)
+                else:
+                    dynamic_tol_sq = base_tol_sq
+
                 return anderson_acceleration(
                     lambda x: f_forward_step(x, x_init, g_bias, target), 
                     x_init, 
-                    m=5, max_iter=local_iters, tol=exit_thr_sq
+                    m=5, max_iter=local_iters, tol=dynamic_tol_sq
                 )
+
+            # Ensure Adjoint Cache matches the current stream shape for warm-starting
+            if self._adjoint_cache.shape != x_stream.shape:
+                # We use a non-parameter buffer to persist state across backward passes
+                self._adjoint_cache = torch.zeros_like(x_stream)
 
             # --- Implicit Differentiation (IFT) Bridge ---
             # Collect all trainable parameters to ensure they are tracked by the DEQ backward solver.
             layer_params = [p for p in self.parameters() if p.requires_grad]
             
             out, iters_run, res_norm = DEQFunction.apply(
-                x_stream, f_solver, f_forward_step, gate_bias, x_target, self.moe.cache_weights, self.moe.clear_cache, *layer_params
+                x_stream, f_solver, f_forward_step, gate_bias, x_target, self.moe.cache_weights, self.moe.clear_cache, self._adjoint_cache, *layer_params
             )
 
         if unbatched:
@@ -226,13 +250,13 @@ class PPCGraphLLM(nn.Module):
         new_shape = list(out_flat.shape[:-1]) + [self.hidden_dim, 2]
         return out_flat.view(*new_shape)
 
-    def forward(self, input_ids: torch.Tensor, local_iters: int = 8) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, local_iters: int = 8, rolling_energy: float = None) -> torch.Tensor:
         x = self.embed(input_ids)            # [B, T, D, 2]
 
         total_iters = 0
         res_energies = []
         for layer in self.layers:
-            x, iters, res_norm = layer(x, local_iters)
+            x, iters, res_norm = layer(x, local_iters, rolling_energy=rolling_energy)
             total_iters += iters
             res_energies.append(res_norm.clone())
 

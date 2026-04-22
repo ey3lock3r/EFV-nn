@@ -18,21 +18,27 @@ class ShardedPPCGraphLLM(nn.Module):
         # GPU Assignment
         self.device0 = "cuda:0" if torch.cuda.is_available() else "cpu"
         self.device1 = "cuda:1" if torch.cuda.device_count() > 1 else self.device0
-
         self.split_point = num_layers // 2
 
+        # Cache device objects to avoid string comparisons in the hot loop
+        self.d0 = torch.device(self.device0)
+        self.d1 = torch.device(self.device1)
+        
         # 1. Sharded Embeddings (GPU 0) - stores interleaved real [V, D, 2]
-        self.embedding = nn.Embedding(vocab_size, hidden_dim * 2).to(self.device0)
+        self.embedding = nn.Embedding(vocab_size, hidden_dim * 2).to(self.d0)
 
         with torch.no_grad():
             # Correctly initialise the interleaved real pair
             init_w = ppc_core.ComplexKaimingInitializer.initialize((vocab_size, hidden_dim))
             self.embedding.weight.copy_(init_w.reshape(vocab_size, hidden_dim * 2))
 
+        # Pre-assign target devices for each layer to avoid conditional logic in loop
+        self.layer_target_devices = [self.d0 if i < self.split_point else self.d1 for i in range(num_layers)]
+
         # 2. Sharded Layer Blocks
         self.layers = nn.ModuleList()
         for i in range(num_layers):
-            target_device = self.device0 if i < self.split_point else self.device1
+            target_device = self.layer_target_devices[i]
             layer = ppc_gnn.PPCNodeLayer(
                 hidden_dim, num_experts=num_experts, local_lr=local_lr,
                 lr_decay=lr_decay, use_jacobian=use_jacobian,
@@ -41,13 +47,9 @@ class ShardedPPCGraphLLM(nn.Module):
             ).to(target_device)
             self.layers.append(layer)
 
-            # Triton kernels are pre-compiled on first call — no cold start needed.
-            # CUDAGraphs Exorcism: We do not use torch.compile as it corrupts memory pools
-            # during dynamic DEQ loop execution.
-
         # 3. Output Head (GPU 1)
-        self.layer_norm = nn.LayerNorm(hidden_dim * 2).to(self.device1)
-        self.output_head = nn.Linear(hidden_dim * 2, vocab_size, bias=True).to(self.device1)
+        self.layer_norm = nn.LayerNorm(hidden_dim * 2).to(self.d1)
+        self.output_head = nn.Linear(hidden_dim * 2, vocab_size, bias=True).to(self.d1)
         nn.init.zeros_(self.output_head.bias)
 
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -56,36 +58,29 @@ class ShardedPPCGraphLLM(nn.Module):
         new_shape = list(out_flat.shape[:-1]) + [self.hidden_dim, 2]
         return out_flat.view(*new_shape)
 
-    def forward(self, input_ids: torch.Tensor, local_iters: int = 8):
-        input_ids = input_ids.to(self.device0)
+    def forward(self, input_ids: torch.Tensor, local_iters: int = 8, rolling_energy: float = None):
+        input_ids = input_ids.to(self.d0)
         x = self.embed(input_ids) # [B, T, D, 2]
-
 
         total_iters = 0
         res_energies = []
         for i, layer in enumerate(self.layers):
-            if i >= self.split_point:
-                target_device = self.device1
-            else:
-                target_device = self.device0
+            target_device = self.layer_target_devices[i]
             
-            if x.device.type != 'cpu' and str(x.device) != target_device:
+            # Optimized Zero-G Guard: Comparison of device objects is much faster than strings
+            if x.device != target_device:
                 x = x.to(target_device)
             
-            # Heavy-Duty Device Guard: Ensure the layer hasn't migrated
-            # We check the first parameter's device.
-            first_param = next(layer.parameters())
-            if str(first_param.device) != target_device:
-                layer.to(target_device)
+            x, iters, res_norm = layer(x, local_iters, rolling_energy=rolling_energy)
 
-            x, iters, res_norm = layer(x, local_iters)
-
-            x = x.clone() # Isolation: Prevent CUDA Graph buffer overwrite in loops
+            # Isolation: Prevent CUDA Graph buffer overwrite in loops
+            # We use a non-blocking clone if possible, but standard clone is safe.
+            x = x.clone() 
             total_iters += iters.item()
             res_energies.append(res_norm.clone())
 
         # Move all scalars to device1 before sum to avoid cross-device error
-        layer_energies = torch.stack([e.to(self.device1) for e in res_energies])
+        layer_energies = torch.stack([e.to(self.d1) for e in res_energies])
         avg_energy = layer_energies.mean()
         
         diagnostics.debug_print_nan(avg_energy, "avg_energy")
