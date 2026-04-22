@@ -168,6 +168,7 @@ class PPCNodeLayer(nn.Module):
                         x, self.delay_gains, self.prime_delays, topk_indices
                     )
                     pred, _, _, _ = self.moe.compute(x_batched, topk_indices, topk_scores, B * T)
+                    pred = pred.reshape(B, T, D, 2)
                 else:
                     if self._triton_available and self.prime_delays and not torch.is_grad_enabled():
                         x_eff = triton_kernels.fused_ocns_delay(x, self.delay_gains, self.prime_delays, out=self._eff_buf)
