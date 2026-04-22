@@ -213,8 +213,8 @@ class ExpertChoiceMoEMatcher(nn.Module):
         topk_indices, topk_scores = self.get_indices(x, gate_bias)
         
         # Standard Dispatch (if not using fused external dispatch)
-        flat_indices = topk_indices.T.reshape(-1)
-        x_batched = x[flat_indices].view(self.num_experts, topk_indices.shape[0], x.shape[1], 2)
+        flat_indices = topk_indices.reshape(-1)
+        x_batched = x[flat_indices].view(self.num_experts, topk_indices.shape[1], x.shape[1], 2)
         
         return self.compute(x_batched, topk_indices, topk_scores, B_T)
 
