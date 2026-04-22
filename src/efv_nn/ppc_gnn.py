@@ -117,7 +117,7 @@ class PPCNodeLayer(nn.Module):
 
         original_dtype = x_stream.dtype
         # Holistic move: PPC iterations MUST be float32 for convergence stability
-        x_stream = x_stream.float()
+        x_stream = torch.nan_to_num(x_stream.float(), nan=0.0)
 
         # Pillar 4: Autocast Isolation. We force everything into FP32 to prevent 
         # compiler-drift in the iterative loop, ensuring E ~ 0.024 baseline.

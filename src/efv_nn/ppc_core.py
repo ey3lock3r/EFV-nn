@@ -152,12 +152,16 @@ class ExpertChoiceMoEMatcher(nn.Module):
         else:
             B_T, D, _ = x.shape
         k_nodes = self.k_nodes_default if self.k_nodes_default is not None else max(1, B_T // self.num_experts)
+        k_nodes = min(B_T, k_nodes) # Safety Clamp
 
         x_gate_input = x.reshape(B_T, D * 2).to(dtype=self.gate_weights.dtype)
         scores = torch.matmul(x_gate_input, self.gate_weights)  # [B_T, num_experts]
 
         if gate_bias is not None:
             scores = scores + gate_bias.to(scores.dtype)
+
+        # Non-blocking NaN Siphon
+        scores = torch.nan_to_num(scores, nan=0.0)
 
         topk_scores, topk_indices = torch.topk(scores, k_nodes, dim=0)  # [k_node, num_experts]
         return topk_indices.T.contiguous(), topk_scores.T.contiguous()
@@ -186,6 +190,9 @@ class ExpertChoiceMoEMatcher(nn.Module):
             yi = torch.matmul(xr_h, wi_h).float() + torch.matmul(xi_h, wr_h).float()
             
         y_all = torch.stack([yr, yi], dim=-1) # [E, k, D, 2]
+
+        # Non-blocking NaN Siphon
+        y_all = torch.nan_to_num(y_all, nan=0.0)
 
         # 4. Score Weighting
         weights = topk_scores.reshape(self.num_experts, k_nodes, 1, 1).to(y_all.dtype)
@@ -286,8 +293,13 @@ class SpectralExpertGate(nn.Module):
             X_mag = X_fft.abs()
             freq_bins = X_mag.shape[1]
             mid = freq_bins // 2
-            low  = X_mag[:, :mid, :].mean(dim=1)
-            high = X_mag[:, mid:, :].mean(dim=1)
+            if mid > 0:
+                low  = X_mag[:, :mid, :].mean(dim=1)
+                high = X_mag[:, mid:, :].mean(dim=1)
+            else:
+                # Fallback for T=1: use the only available bin (DC component) for both
+                low  = X_mag.squeeze(1)
+                high = X_mag.squeeze(1)
 
         low_bias  = self.low_freq_proj(low).unsqueeze(1).expand(B, T, -1)
         high_bias = self.high_freq_proj(high).unsqueeze(1).expand(B, T, -1)

@@ -42,6 +42,11 @@ def anderson_acceleration(f: Callable, x0: torch.Tensor, m: int = 5, lam: float 
         f_x_flat = f_x.reshape(B, -1)
         
         res_k = f_x_flat - x_flat
+        
+        # NaN Siphon: Replace any NaNs with 0 to prevent solver explosion
+        if torch.isnan(res_k).any():
+            res_k = torch.where(torch.isnan(res_k), torch.zeros_like(res_k), res_k)
+            
         res_norm = torch.norm(res_k, dim=-1).mean()
         if res_norm < tol:
             break
@@ -53,8 +58,8 @@ def anderson_acceleration(f: Callable, x0: torch.Tensor, m: int = 5, lam: float 
             G_hist = F[:, idx] - X[:, idx]
             dG[:, :, i] = res_k - G_hist
             
-        # Regularization: 1e-3 is safer than 1e-4 for initial phasal resonance
-        lam_stable = lam * 10 if k < 5 else lam
+        # Regularization: 1e-2 is much safer for the first few steps of Phase 0
+        lam_stable = lam * 100 if k < 5 else lam
         dG_curr = dG[:, :, :m_k]
         dG_T = dG_curr.transpose(1, 2)
         A = torch.bmm(dG_T, dG_curr) + lam_stable * torch.eye(m_k, dtype=x.dtype, device=x.device).unsqueeze(0)
@@ -63,7 +68,7 @@ def anderson_acceleration(f: Callable, x0: torch.Tensor, m: int = 5, lam: float 
         try:
             # solve is more stable in FP32
             alpha = torch.linalg.solve(A.float(), b.float()).to(x.dtype).squeeze(-1) # [B, m_k]
-        except torch._C._LinAlgError:
+        except (torch._C._LinAlgError, RuntimeError):
             alpha = torch.zeros(B, m_k, dtype=x.dtype, device=x.device)
             
         if diagnostics.debug_print_nan(alpha, f"anderson.alpha_{k}"):

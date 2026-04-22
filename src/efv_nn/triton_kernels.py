@@ -398,8 +398,10 @@ def _spectral_gate_pool_kernel(
     high_mask = t_mask & (t_off >= mid)
     low_sum = tl.sum(tl.where(low_mask, mag, 0.0))
     high_sum = tl.sum(tl.where(high_mask, mag, 0.0))
-    low_mean = low_sum / mid
-    high_mean = high_sum / (T_half - mid)
+    mid_safe = tl.maximum(mid.to(tl.float32), 1.0)
+    span_safe = tl.maximum((T_half - mid).to(tl.float32), 1.0)
+    low_mean = low_sum / mid_safe
+    high_mean = high_sum / span_safe
     out_base = (pid_b * D + pid_d) * 2
     tl.store(out_ptr + out_base,     low_mean)
     tl.store(out_ptr + out_base + 1, high_mean)
