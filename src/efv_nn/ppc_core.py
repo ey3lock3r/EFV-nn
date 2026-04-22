@@ -146,7 +146,11 @@ class ExpertChoiceMoEMatcher(nn.Module):
 
     def get_indices(self, x, gate_bias=None):
         """Calculates routing indices and scores for MoE dispatch."""
-        B_T, D, _ = x.shape
+        if x.dim() == 4:
+            B, T, D, _ = x.shape
+            B_T = B * T
+        else:
+            B_T, D, _ = x.shape
         k_nodes = self.k_nodes_default if self.k_nodes_default is not None else max(1, B_T // self.num_experts)
 
         x_gate_input = x.reshape(B_T, D * 2).to(dtype=self.gate_weights.dtype)
