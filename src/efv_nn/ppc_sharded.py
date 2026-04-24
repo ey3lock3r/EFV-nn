@@ -90,6 +90,7 @@ class ShardedPPCGraphLLM(nn.Module):
         total_aux_loss = torch.tensor(0.0, device=self.d1)
         # Pre-allocate energy tensor on d1 to avoid per-layer to() calls and list + stack
         layer_energies = torch.empty(self.num_layers, device=self.d1, dtype=torch.float32)
+        current_energy = rolling_energy  # seed with caller-provided value or None
         for i, layer in enumerate(self.layers):
             target_device = self.layer_target_devices[i]
 
@@ -97,12 +98,15 @@ class ShardedPPCGraphLLM(nn.Module):
             if x.device != target_device:
                 x = x.to(target_device)
 
-            x, iters, res_norm, aux_loss = layer(x, local_iters, rolling_energy=rolling_energy)
+            x, iters, res_norm, aux_loss = layer(x, local_iters, rolling_energy=current_energy)
 
             # Isolation: Prevent CUDA Graph buffer overwrite in loops
             x = x.clone()
             total_iters += iters.item()
-            layer_energies[i] = res_norm.to(self.d1)
+            e = ppc_gnn.phasal_energy(x).item()
+            layer_energies[i] = e
+            # Update rolling_energy as EMA so later layers see energy from earlier layers
+            current_energy = e if current_energy is None else 0.9 * current_energy + 0.1 * e
             total_aux_loss = total_aux_loss + aux_loss.to(self.d1)
 
         avg_energy = layer_energies.mean()

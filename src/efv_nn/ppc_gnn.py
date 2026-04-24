@@ -33,6 +33,11 @@ def spectral_guardian_penalty(layer_energies: torch.Tensor, lam: float = 0.01) -
     return lam * ((ratio - 1.0) ** 2).sum()
 
 
+def phasal_energy(z: torch.Tensor) -> torch.Tensor:
+    """Mean squared complex magnitude of an interleaved-real tensor [..., D, 2]."""
+    return (z[..., 0] ** 2 + z[..., 1] ** 2).mean()
+
+
 class PPCNodeLayer(nn.Module):
     def __init__(self, hidden_dim: int, num_experts: int = 64, local_lr: float = 0.05,
                  lr_decay: float = 0.8, use_jacobian: bool = False,
@@ -277,10 +282,14 @@ class PPCGraphLLM(nn.Module):
         total_iters = 0
         total_aux_loss = torch.tensor(0.0, device=x.device)
         layer_energies = torch.empty(len(self.layers), device=x.device, dtype=torch.float32)
+        current_energy = rolling_energy  # seed with caller-provided value or None
         for i, layer in enumerate(self.layers):
-            x, iters, res_norm, aux_loss = layer(x, local_iters, rolling_energy=rolling_energy)
-            total_iters += iters
-            layer_energies[i] = res_norm
+            x, iters, res_norm, aux_loss = layer(x, local_iters, rolling_energy=current_energy)
+            total_iters += iters.item() if isinstance(iters, torch.Tensor) else iters
+            e = phasal_energy(x).item()
+            layer_energies[i] = e
+            # Update rolling_energy as EMA so later layers see energy from earlier layers
+            current_energy = e if current_energy is None else 0.9 * current_energy + 0.1 * e
             total_aux_loss = total_aux_loss + aux_loss
 
         avg_energy = layer_energies.mean()
