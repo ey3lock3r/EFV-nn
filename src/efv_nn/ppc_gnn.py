@@ -197,8 +197,9 @@ class PPCNodeLayer(nn.Module):
                 # tol is compared directly against res_norm (L2 norm), not its square.
                 base_tol = self.exit_threshold.item()
                 if rolling_energy is not None:
-                    # 0.05 multiplier: standard for phasal locking; relaxes exit in Phase 0
-                    dynamic_tol = max(base_tol, rolling_energy * 0.05)
+                    # Invert relationship: high energy = volatile phase = need tighter convergence.
+                    # Divide base_tol by (1 + scaled_energy) to tighten when energy is high.
+                    dynamic_tol = base_tol / (1.0 + rolling_energy * 0.1)
                 else:
                     dynamic_tol = base_tol
 
