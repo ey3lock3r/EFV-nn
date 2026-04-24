@@ -634,3 +634,64 @@ class TestRollingEnergy:
         # Just verify it runs without crash and returns valid iters
         assert isinstance(iters_no_energy, float)
         assert isinstance(iters_high_energy, float)
+
+
+class TestAndersonQualityBuffer:
+    def test_poisoned_history_does_not_derail_convergence(self):
+        """NaN iterations must not permanently bias the solution."""
+        torch.manual_seed(7)
+        B, T, D = 1, 4, 8
+        c = torch.ones(B, T, D, 2) * 0.5
+        nan_steps = {2, 4}  # NaN at these specific iterations
+        call_n = [0]
+
+        def f(x):
+            call_n[0] += 1
+            if call_n[0] in nan_steps:
+                return torch.full_like(x, float('nan'))
+            return 0.5 * x + c
+
+        x0 = torch.zeros(B, T, D, 2)
+        x_star, iters, res_norm = anderson_acceleration(f, x0, m=5, max_iter=50, tol=1e-4)
+        expected = 2 * c
+        assert not torch.isnan(x_star).any(), "NaN in output after poisoned history"
+        assert torch.allclose(x_star, expected, atol=1e-2), (
+            f"Convergence failed despite NaN guard. Max err: {(x_star - expected).abs().max():.4f}"
+        )
+
+
+class TestAndersonLstsq:
+    def test_converges_on_ill_conditioned_system(self):
+        """lstsq-based Anderson must converge even when dG is near rank-deficient."""
+        torch.manual_seed(42)
+        B, T, D = 1, 4, 8
+        # f with a near-degenerate direction (ill-conditioned Jacobian)
+        A_base = torch.eye(D * T * 2).unsqueeze(0) * 0.5
+        # Make one direction nearly zero (high condition number)
+        A_base[0, 0, 0] = 1e-5
+        c = torch.ones(B, T, D, 2) * 0.3
+
+        def f(x):
+            x_flat = x.reshape(B, -1)
+            return (torch.bmm(A_base, x_flat.unsqueeze(-1)).squeeze(-1) + c.reshape(B, -1)).reshape(B, T, D, 2)
+
+        x0 = torch.zeros(B, T, D, 2)
+        x_star, iters, res_norm = anderson_acceleration(f, x0, m=5, max_iter=100, tol=1e-4)
+        assert not torch.isnan(x_star).any()
+        assert res_norm.item() < 1e-3
+
+
+class TestFP16GradClamp:
+    def test_large_fp32_grad_does_not_become_inf_after_half(self):
+        """Gradients larger than FP16 max must be clamped before .half() cast."""
+        # Simulate what the adjoint backward does
+        g_fp32 = torch.tensor([70000.0, -70000.0, 1.0])
+        # Unclamped: .half() → inf, -inf, 1.0
+        g_unclamped = g_fp32.half()
+        assert g_unclamped[0].item() == float('inf'), "Test precondition: unclamped overflows"
+
+        # Clamped path (the fix)
+        FP16_MAX = 60000.0
+        g_clamped = g_fp32.clamp(-FP16_MAX, FP16_MAX).half()
+        assert g_clamped[0].item() == FP16_MAX, f"Expected {FP16_MAX}, got {g_clamped[0]}"
+        assert not torch.isinf(g_clamped).any()

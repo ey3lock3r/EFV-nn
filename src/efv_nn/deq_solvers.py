@@ -38,23 +38,26 @@ def anderson_acceleration(f: Callable, x0: torch.Tensor, m: int = 5, lam: float 
     res_norm = torch.norm(f_x_flat - X[:, 0], dim=-1).mean()
     
     dG = torch.zeros(B, N, m, dtype=x.dtype, device=x.device)
-    # Pre-allocate identity for regularization — avoids re-alloc on every iteration
-    eye_m = torch.eye(m, dtype=torch.float32, device=x.device).unsqueeze(0)  # [1, m, m]
     # Pre-allocate F_ordered buffer for the Triton mixing path
     F_ordered_buf = torch.empty(B, m, N, dtype=x.dtype, device=x.device) if (_TRITON_AVAILABLE and x.is_cuda) else None
     x_next_flat = torch.empty_like(f_x_flat) if (_TRITON_AVAILABLE and x.is_cuda) else None
 
+    best_res = float('inf')
     for k in range(1, max_iter):
         iters_run += 1
         f_x = f(x)
         f_x_flat = f_x.reshape(B, -1)
 
+        # NaN Siphon: on poisoned steps, keep x unchanged and mirror previous history slot
+        # to prevent gaps in the circular buffer that corrupt dG indexing.
+        nan_step = torch.isnan(f_x_flat).any()
+        if nan_step:
+            buf_idx = k % m
+            X[:, buf_idx] = x_flat
+            F[:, buf_idx] = F[:, (k - 1) % m]  # repeat previous valid F entry
+            continue
+
         res_k = f_x_flat - x_flat
-
-        # NaN Siphon: Replace any NaNs with 0 to prevent solver explosion
-        if torch.isnan(res_k).any():
-            res_k = torch.nan_to_num(res_k, nan=0.0)
-
         res_norm = torch.norm(res_k, dim=-1).mean()
         if res_norm < tol:
             break
@@ -66,16 +69,11 @@ def anderson_acceleration(f: Callable, x0: torch.Tensor, m: int = 5, lam: float 
             G_hist = F[:, idx] - X[:, idx]
             dG[:, :, i] = res_k - G_hist
 
-        # Regularization: 1e-2 is much safer for the first few steps of Phase 0
-        lam_stable = lam * 100 if k < 5 else lam
-        dG_curr = dG[:, :, :m_k]
-        dG_T = dG_curr.transpose(1, 2)
-        A = torch.bmm(dG_T, dG_curr) + lam_stable * eye_m[:, :m_k, :m_k]
-        b = torch.bmm(dG_T, res_k.unsqueeze(-1))
-
+        dG_curr = dG[:, :, :m_k]  # [B, N, m_k]
         try:
-            # solve is more stable in FP32
-            alpha = torch.linalg.solve(A.float(), b.float()).to(x.dtype).squeeze(-1) # [B, m_k]
+            # lstsq uses SVD — condition number is κ(dG) not κ(dGᵀdG). No manual regularisation needed.
+            result = torch.linalg.lstsq(dG_curr.float(), res_k.float().unsqueeze(-1))
+            alpha = result.solution.to(x.dtype).squeeze(-1)  # [B, m_k]
         except (torch._C._LinAlgError, RuntimeError):
             alpha = torch.zeros(B, m_k, dtype=x.dtype, device=x.device)
 
@@ -88,11 +86,14 @@ def anderson_acceleration(f: Callable, x0: torch.Tensor, m: int = 5, lam: float 
 
         diagnostics.debug_print_nan(res_norm, f"anderson.res_norm_{k}")
 
-        # --- Update History ---
+        # --- Update History (monotonic: only write F if this iterate improved residual) ---
         buf_idx = k % m
+        current_res = res_norm.item()
         X[:, buf_idx] = x_flat
-        # NaN Siphon: sanitize before storing in history
-        F[:, buf_idx] = torch.nan_to_num(f_x_flat, nan=0.0, posinf=10.0, neginf=-10.0)
+        f_sanitized = f_x_flat  # already confirmed non-NaN above
+        if current_res <= best_res * 1.5:
+            F[:, buf_idx] = f_sanitized
+            best_res = min(best_res, current_res)
 
         # --- Next x (Triton Optimized) ---
         if _TRITON_AVAILABLE and x.is_cuda:
@@ -228,10 +229,12 @@ class DEQFunction(torch.autograd.Function):
                     continue
                 if fp16_p.grad is None:
                     fp16_p.grad = torch.zeros_like(fp16_p)
+                _FP16_MAX = 60000.0
+                g_fp32_safe = g_fp32.clamp(-_FP16_MAX, _FP16_MAX)
                 if slice_str == '[...,0]':
-                    fp16_p.grad[..., 0].add_(g_fp32.half())
+                    fp16_p.grad[..., 0].add_(g_fp32_safe.half())
                 else:
-                    fp16_p.grad[..., 1].add_(g_fp32.half())
+                    fp16_p.grad[..., 1].add_(g_fp32_safe.half())
 
         finally:
             if ctx.cleanup_fn is not None:
