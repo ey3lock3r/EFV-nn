@@ -216,9 +216,10 @@ class PPCNodeLayer(nn.Module):
                     m=5, max_iter=local_iters, tol=dynamic_tol
                 )
 
-            # Ensure Adjoint Cache matches the current stream shape for warm-starting
-            if self._adjoint_cache.shape != x_stream.shape:
-                # We use a non-parameter buffer to persist state across backward passes
+            # Ensure Adjoint Cache matches the current stream shape for warm-starting.
+            # Only resize when grad is enabled (training); inference calls (generate) must
+            # never overwrite the training-shape cache or the warm-start is lost on resume.
+            if self._adjoint_cache.shape != x_stream.shape and torch.is_grad_enabled():
                 self._adjoint_cache = torch.zeros_like(x_stream)
 
             # --- Implicit Differentiation (IFT) Bridge ---
