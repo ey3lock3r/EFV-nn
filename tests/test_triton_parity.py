@@ -1,8 +1,8 @@
 """
 Numerical Parity Tests for Triton Kernels.
 
-Verifies that each Triton kernel produces bit-identical results (within FP32 tolerance)
-to the equivalent Python/PyTorch implementation.
+Verifies that each Triton kernel produces numerically consistent results (within FP32
+tolerance) with the equivalent Python/PyTorch reference implementation.
 """
 import pytest
 import torch
@@ -84,12 +84,12 @@ class TestOCNSDelayParity:
         assert torch.allclose(ref, tri, atol=1e-5, rtol=1e-5), \
             f"Max diff: {(ref - tri).abs().max().item()}"
 
-    def test_parity_7_delays(self, device, dims):
-        """Test with extended Fibonacci delays."""
+    def test_parity_production_8_tap(self, device, dims):
+        """Test with the exact production prime delays [1,2,3,5,7,11,13,17]."""
         from efv_nn.triton_kernels import fused_ocns_delay
 
         B, T, D = dims["B"], dims["T"], dims["D"]
-        prime_delays = [1, 2, 3, 5, 8, 13, 21]
+        prime_delays = [1, 2, 3, 5, 7, 11, 13, 17]  # production config
         x_states = torch.randn(B, T, D, 2, device=device, dtype=torch.float32)
         delay_gains = torch.randn(len(prime_delays), D, 2, device=device, dtype=torch.float32) * 0.01
 
@@ -131,13 +131,17 @@ class TestStateUpdateParity:
 # ============================================================
 class TestNormalizeActivateParity:
     def _python_normalize_activate(self, output, counts, bias):
-        """Python reference (ModReLU)."""
-        normed = output / counts.clamp(min=1)
-        mag = torch.norm(normed, dim=-1)
-        safe_mag = mag.clamp(min=1e-8)
-        unit_phase = normed / safe_mag.unsqueeze(-1)
-        activated_mag = torch.relu(mag + bias)
-        return activated_mag.unsqueeze(-1) * unit_phase
+        """Python reference matching the actual ComplexGELU Triton implementation.
+
+        Kernel 4 applies: divide by count, then GELU(component + bias) independently
+        on real and imaginary parts — NOT ModReLU (which was a prior design).
+        """
+        import torch.nn.functional as F
+        normed = output / counts.view(-1, 1, 1).clamp(min=1)
+        # Independent ComplexGELU with shared bias
+        real_act = F.gelu(normed[..., 0] + bias)
+        imag_act = F.gelu(normed[..., 1] + bias)
+        return torch.stack([real_act, imag_act], dim=-1)
 
     def test_parity(self, device, dims):
         from efv_nn.triton_kernels import fused_normalize_activate
@@ -145,7 +149,7 @@ class TestNormalizeActivateParity:
         B, T, D = dims["B"], dims["T"], dims["D"]
         B_T = B * T
         output = torch.randn(B_T, D, 2, device=device, dtype=torch.float32)
-        counts = torch.randint(1, 5, (B_T, 1, 1), device=device, dtype=torch.float32)
+        counts = torch.randint(1, 5, (B_T,), device=device, dtype=torch.float32)
         bias = torch.randn(D, device=device, dtype=torch.float32) * 0.1
 
         ref = self._python_normalize_activate(output, counts, bias)

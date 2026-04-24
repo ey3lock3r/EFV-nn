@@ -25,83 +25,88 @@ def anderson_acceleration(f: Callable, x0: torch.Tensor, m: int = 5, lam: float 
     x_flat = x.reshape(B, -1)
     f_x = f(x)
     f_x_flat = f_x.reshape(B, -1)
-    
+    # NaN Siphon: sanitize before storing in history to prevent cascade poisoning
+    f_x_flat = torch.nan_to_num(f_x_flat, nan=0.0, posinf=10.0, neginf=-10.0)
+
     X[:, 0] = x_flat
     F[:, 0] = f_x_flat
-    
-    x = f_x
+
+    x = f_x_flat.reshape(B, T, D, 2)
     x_flat = x.reshape(B, -1)
     
     iters_run = 1
     res_norm = torch.norm(f_x_flat - X[:, 0], dim=-1).mean()
     
     dG = torch.zeros(B, N, m, dtype=x.dtype, device=x.device)
+    # Pre-allocate identity for regularization — avoids re-alloc on every iteration
+    eye_m = torch.eye(m, dtype=torch.float32, device=x.device).unsqueeze(0)  # [1, m, m]
+    # Pre-allocate F_ordered buffer for the Triton mixing path
+    F_ordered_buf = torch.empty(B, m, N, dtype=x.dtype, device=x.device) if (_TRITON_AVAILABLE and x.is_cuda) else None
+    x_next_flat = torch.empty_like(f_x_flat) if (_TRITON_AVAILABLE and x.is_cuda) else None
+
     for k in range(1, max_iter):
         iters_run += 1
         f_x = f(x)
         f_x_flat = f_x.reshape(B, -1)
-        
+
         res_k = f_x_flat - x_flat
-        
+
         # NaN Siphon: Replace any NaNs with 0 to prevent solver explosion
         if torch.isnan(res_k).any():
-            res_k = torch.where(torch.isnan(res_k), torch.zeros_like(res_k), res_k)
-            
+            res_k = torch.nan_to_num(res_k, nan=0.0)
+
         res_norm = torch.norm(res_k, dim=-1).mean()
         if res_norm < tol:
             break
-            
+
         m_k = min(k, m)
         # Update dG in-place for current history window
         for i in range(m_k):
             idx = (k - 1 - i) % m
             G_hist = F[:, idx] - X[:, idx]
             dG[:, :, i] = res_k - G_hist
-            
+
         # Regularization: 1e-2 is much safer for the first few steps of Phase 0
         lam_stable = lam * 100 if k < 5 else lam
         dG_curr = dG[:, :, :m_k]
         dG_T = dG_curr.transpose(1, 2)
-        A = torch.bmm(dG_T, dG_curr) + lam_stable * torch.eye(m_k, dtype=x.dtype, device=x.device).unsqueeze(0)
+        A = torch.bmm(dG_T, dG_curr) + lam_stable * eye_m[:, :m_k, :m_k]
         b = torch.bmm(dG_T, res_k.unsqueeze(-1))
-        
+
         try:
             # solve is more stable in FP32
             alpha = torch.linalg.solve(A.float(), b.float()).to(x.dtype).squeeze(-1) # [B, m_k]
         except (torch._C._LinAlgError, RuntimeError):
             alpha = torch.zeros(B, m_k, dtype=x.dtype, device=x.device)
-            
-        if diagnostics.debug_print_nan(alpha, f"anderson.alpha_{k}"):
+
+        diagnostics.debug_print_nan(alpha, f"anderson.alpha_{k}")
+        if torch.isnan(alpha).any():
             alpha = torch.zeros(B, m_k, dtype=x.dtype, device=x.device)
-        
+
         # Alpha Clipping: Prevent extreme jumps in the state space
         alpha = torch.clamp(alpha, -1.0, 1.0)
-            
+
         diagnostics.debug_print_nan(res_norm, f"anderson.res_norm_{k}")
-            
+
         # --- Update History ---
         buf_idx = k % m
         X[:, buf_idx] = x_flat
-        F[:, buf_idx] = f_x_flat
+        # NaN Siphon: sanitize before storing in history
+        F[:, buf_idx] = torch.nan_to_num(f_x_flat, nan=0.0, posinf=10.0, neginf=-10.0)
 
         # --- Next x (Triton Optimized) ---
         if _TRITON_AVAILABLE and x.is_cuda:
-            # We need to pass the actual history slices. 
-            # To avoid allocation, we pass the full F and let the kernel index it.
-            # But alpha needs to correspond to the indices (k-1, k-2...).
-            # Actually, let's just use the current order for simplicity or re-order alpha.
-            # Simpler: Use Triton for the element-wise mixing part.
-            x_next_flat = torch.empty_like(f_x_flat)
-            # Re-order history to match alpha's expected indices for the fused kernel
-            F_ordered = torch.stack([F[:, (k - 1 - i) % m] for i in range(m_k)], dim=1)
-            triton_kernels.anderson_mixing(f_x_flat, F_ordered, alpha, m_k, out=x_next_flat)
+            # Re-order history into pre-allocated buffer to avoid torch.stack list allocation
+            for i in range(m_k):
+                F_ordered_buf[:, i] = F[:, (k - 1 - i) % m]
+            triton_kernels.anderson_mixing(f_x_flat, F_ordered_buf[:, :m_k], alpha, m_k, out=x_next_flat)
+            x_flat = torch.nan_to_num(x_next_flat, nan=0.0, posinf=10.0, neginf=-10.0)
         else:
             x_next_flat = f_x_flat.clone()
             for i in range(m_k):
                 idx = (k - 1 - i) % m
                 x_next_flat -= alpha[:, i:i+1] * (f_x_flat - F[:, idx])
-        
-        x_flat = x_next_flat
+            x_flat = torch.nan_to_num(x_next_flat, nan=0.0, posinf=10.0, neginf=-10.0)
         x = x_flat.reshape(B, T, D, 2)
         
     return x, iters_run, res_norm
@@ -109,84 +114,128 @@ def anderson_acceleration(f: Callable, x0: torch.Tensor, m: int = 5, lam: float 
 
 class DEQFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x_in, f_solver, f_forward, gate_bias, target, setup_fn, cleanup_fn, adjoint_cache, *params):
+    def forward(ctx, x_in, f_solver, f_forward, gate_bias, target, setup_fn, cleanup_fn, adjoint_cache, fp16_modules, *params):
         if setup_fn is not None: setup_fn()
-        with torch.no_grad():
-            z_star, iters, res_norm = f_solver(x_in, gate_bias, target)
-        if cleanup_fn is not None: cleanup_fn()
-        
+        try:
+            with torch.no_grad():
+                z_star, iters, res_norm = f_solver(x_in, gate_bias, target)
+        finally:
+            if cleanup_fn is not None: cleanup_fn()
+
         ctx.save_for_backward(z_star.detach(), x_in, gate_bias, target, adjoint_cache, *params)
         ctx.f_forward = f_forward
         ctx.setup_fn = setup_fn
         ctx.cleanup_fn = cleanup_fn
+        ctx.fp16_modules = fp16_modules  # list of modules with FP16 params and FP32 caches
         return z_star.detach(), torch.tensor(float(iters), device=x_in.device), res_norm
 
     @staticmethod
     def backward(ctx, grad_output, grad_iters, grad_res):
         z_star, x_in, gate_bias, target, adjoint_cache, *params = ctx.saved_tensors
         f_forward = ctx.f_forward
+        fp16_modules = ctx.fp16_modules
 
-        if hasattr(ctx, 'setup_fn') and ctx.setup_fn is not None:
-            ctx.setup_fn()
+        try:
+            # 1. Solve (I - J^T) g = grad_output
+            # setup_fn MUST run inside enable_grad so that _wr_f32/_wi_f32 are created
+            # with requires_grad=True (backward engine runs under no_grad by default).
+            with torch.enable_grad():
+                if ctx.setup_fn is not None:
+                    ctx.setup_fn()
+                z_star_leaf = z_star.detach().requires_grad_(True)
+                z_next = f_forward(z_star_leaf, x_in, gate_bias, target)
 
-        # 1. Solve (I - J^T) g = grad_output
-        with torch.enable_grad():
-            z_star_leaf = z_star.detach().requires_grad_(True)
-            z_next = f_forward(z_star_leaf, x_in, gate_bias, target)
+            def backward_f(g_curr):
+                vjp = torch.autograd.grad(z_next, z_star_leaf, grad_outputs=g_curr, retain_graph=True)[0]
 
-        def backward_f(g_curr):
-            vjp = torch.autograd.grad(z_next, z_star_leaf, grad_outputs=g_curr, retain_graph=True)[0]
-            
-            # Adjoint Normalization: If the VJP explodes, we dampen it.
-            vjp_norm = torch.linalg.norm(vjp)
-            if vjp_norm > 100.0:
-                vjp = vjp * (100.0 / vjp_norm)
-                
-            return grad_output + vjp
+                # Adjoint Normalization: If the VJP explodes, we dampen it.
+                vjp_norm = torch.linalg.norm(vjp)
+                if vjp_norm > 100.0:
+                    vjp = vjp * (100.0 / vjp_norm)
 
-        # --- ADJOINT WARM-STARTING ---
-        # If cache exists and matches shape, use it as starting guess.
-        # This reduces backward iters from ~8 to 3-4.
-        g0 = adjoint_cache if adjoint_cache.shape == grad_output.shape else grad_output
-        
-        # --- ADJOINT EARLY-EXIT (Dynamic Tolerance) ---
-        # We relax the tolerance if the initial residual is high, allowing faster convergence
-        # in early phasal training.
-        with torch.no_grad():
-            res0 = torch.norm(backward_f(g0) - g0).item()
-            # 1e-3 is a safe target for adjoint stability
-            dynamic_tol = max(1e-5, res0 * 0.1) 
+                return grad_output + vjp
 
-        g, _, _ = anderson_acceleration(backward_f, g0, m=5, max_iter=12, tol=dynamic_tol)
-        
-        # Update cache in-place for the next step
-        if adjoint_cache.shape == g.shape:
-            adjoint_cache.copy_(g.detach())
+            # --- ADJOINT WARM-STARTING ---
+            # If cache exists and matches shape, use it as starting guess.
+            # This reduces backward iters from ~8 to 3-4.
+            g0 = adjoint_cache if adjoint_cache.shape == grad_output.shape else grad_output
 
-        # Adjoint Safety Check
-        if torch.isnan(g).any():
-            g = grad_output
+            # --- ADJOINT EARLY-EXIT (Dynamic Tolerance) ---
+            # We relax the tolerance if the initial residual is high, allowing faster convergence
+            # in early phasal training.
+            with torch.no_grad():
+                res0 = torch.norm(backward_f(g0) - g0).item()
+                # 1e-3 is a safe target for adjoint stability
+                dynamic_tol = max(1e-5, res0 * 0.1)
 
-        grad_targets = []
-        target_indices = []
-        if ctx.needs_input_grad[0]: grad_targets.append(x_in); target_indices.append(0)
-        if ctx.needs_input_grad[3]: grad_targets.append(gate_bias); target_indices.append(3)
-        if ctx.needs_input_grad[4]: grad_targets.append(target); target_indices.append(4)
-        
-        param_start_idx = 8 # shifted by 1 because of adjoint_cache
-        for i, p in enumerate(params):
-            if ctx.needs_input_grad[param_start_idx + i]:
-                grad_targets.append(p)
-                target_indices.append(param_start_idx + i)
-        
-        grads = torch.autograd.grad(z_next, grad_targets, grad_outputs=g, retain_graph=True, allow_unused=True)
-        
-        if hasattr(ctx, 'cleanup_fn') and ctx.cleanup_fn is not None:
-            ctx.cleanup_fn()
+            g, _, _ = anderson_acceleration(backward_f, g0, m=5, max_iter=12, tol=dynamic_tol)
 
-        res = [None] * len(ctx.needs_input_grad)
-        for i, g_out in zip(target_indices, grads): 
-            res[i] = g_out
-            
+            # Update cache in-place for the next step
+            if adjoint_cache.shape == g.shape:
+                adjoint_cache.copy_(g.detach())
+
+            # Adjoint Safety Check
+            if torch.isnan(g).any():
+                g = grad_output
+
+            res = [None] * len(ctx.needs_input_grad)
+
+            # Compute grad for inputs and FP32 parameters via autograd.grad.
+            # FP16 parameters cannot be targets of autograd.grad inside a backward pass.
+            # Instead, diff w.r.t. their FP32 proxy caches (_wr_f32/_wi_f32) and
+            # backprop through the FP16→FP32 cast to recover the FP16 param grad.
+            grad_targets = []
+            target_indices = []
+            fp32_proxy_targets = []  # (fp32_tensor, fp16_param) pairs
+            # Non-leaf intermediates (x_in, gate_bias, target) come back from saved_tensors
+            # with requires_grad=False — guard before adding to avoid "does not require grad".
+            if ctx.needs_input_grad[0] and x_in.requires_grad:
+                grad_targets.append(x_in); target_indices.append(0)
+            if ctx.needs_input_grad[3] and gate_bias is not None and gate_bias.requires_grad:
+                grad_targets.append(gate_bias); target_indices.append(3)
+            if ctx.needs_input_grad[4] and target.requires_grad:
+                grad_targets.append(target); target_indices.append(4)
+
+            param_start_idx = 9  # shifted by 2: adjoint_cache + fp16_modules placeholder
+            for i, p in enumerate(params):
+                if ctx.needs_input_grad[param_start_idx + i] and p.requires_grad:
+                    if p.dtype == torch.float16:
+                        # Handle via FP32 proxy — collected separately below
+                        pass
+                    else:
+                        grad_targets.append(p)
+                        target_indices.append(param_start_idx + i)
+
+            # Add FP32 proxies for FP16 params from fp16_modules.
+            # Skip if already FP32 (e.g. after model.float()) — direct param path handles it.
+            for mod in (fp16_modules or []):
+                if (hasattr(mod, '_wr_f32') and mod._wr_f32 is not None
+                        and mod.experts_weight_real.dtype == torch.float16):
+                    fp32_proxy_targets.append((mod._wr_f32, mod.experts_weight_real, '[...,0]'))
+                if (hasattr(mod, '_wi_f32') and mod._wi_f32 is not None
+                        and mod.experts_weight_real.dtype == torch.float16):
+                    fp32_proxy_targets.append((mod._wi_f32, mod.experts_weight_real, '[...,1]'))
+
+            all_targets = grad_targets + [t for t, _, _ in fp32_proxy_targets]
+            grads = torch.autograd.grad(z_next, all_targets, grad_outputs=g, retain_graph=True, allow_unused=True)
+
+            for idx, g_out in zip(target_indices, grads[:len(grad_targets)]):
+                res[idx] = g_out
+
+            # Backprop FP32 proxy grads through FP16→FP32 cast to accumulate on FP16 param
+            for (fp32_t, fp16_p, slice_str), g_fp32 in zip(fp32_proxy_targets, grads[len(grad_targets):]):
+                if g_fp32 is None:
+                    continue
+                if fp16_p.grad is None:
+                    fp16_p.grad = torch.zeros_like(fp16_p)
+                if slice_str == '[...,0]':
+                    fp16_p.grad[..., 0].add_(g_fp32.half())
+                else:
+                    fp16_p.grad[..., 1].add_(g_fp32.half())
+
+        finally:
+            if ctx.cleanup_fn is not None:
+                ctx.cleanup_fn()
+
         return tuple(res)
 

@@ -57,8 +57,8 @@ class SpectralExpertGate(nn.Module):
         self.low_freq_proj  = nn.Linear(spectral_feat_dim, num_experts, bias=False)
         self.high_freq_proj = nn.Linear(spectral_feat_dim, num_experts, bias=False)
 
-        # Learnable blend: how much spectral bias matters vs magnitude routing
-        self.spectral_blend = nn.Parameter(torch.tensor(0.1))
+        # Learnable blend: start at zero so spectral gate has no influence at init (safe for resume)
+        self.spectral_blend = nn.Parameter(torch.tensor(0.0))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -201,7 +201,7 @@ class SpectralShardedPPCGraphLLM(ShardedPPCGraphLLM):
         x = self.embed(input_ids)  # [B, T, D, 2]
 
         total_iters = 0
-        res_energies = []
+        layer_energies = torch.empty(self.num_layers, device=self.device1, dtype=torch.float32)
 
         # Pillar 1: Compute spectral gate bias per shard
         gate_bias_0 = None
@@ -229,10 +229,9 @@ class SpectralShardedPPCGraphLLM(ShardedPPCGraphLLM):
 
             x, iters, res_norm = layer(x, local_iters, gate_bias=current_gate_bias)
             x = x.clone()
-            total_iters += iters
-            res_energies.append(res_norm)
+            total_iters += iters.item()
+            layer_energies[i] = res_norm.to(self.device1)
 
-        layer_energies = torch.stack([e.to(self.device1) for e in res_energies])
         avg_energy = layer_energies.mean()
 
         x_flat = x.flatten(-2)

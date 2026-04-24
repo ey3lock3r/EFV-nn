@@ -3,19 +3,29 @@ name = "efv-nn"
 version = "0.2.0"
 description = "Energy-Frequency-Vibration (EFV) Learning Algorithm"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11,<3.12"
 dependencies = [
+    "torch>=2.2.0",
+    "numpy>=1.26,<2.0",
+    "wandb",
+    "tqdm",
     "matplotlib",
-    "numpy<2.0.0",
     "scikit-learn",
-    "torch",
 ]
 
 [project.optional-dependencies]
-quantization = ["bitsandbytes==0.42.0"]
+# GPU-only extras: install with `uv sync --extra gpu` on Kaggle
+gpu = [
+    "bitsandbytes>=0.42.0",
+    "triton; sys_platform == 'linux'",
+]
 
 [dependency-groups]
 dev = [
     "pytest>=8.0.0",
     "pytest-cov>=4.1.0",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+

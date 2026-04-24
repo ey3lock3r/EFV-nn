@@ -51,7 +51,7 @@ def train_ppc_sharded(model, dataloader, lr=1e-4, epochs=1, local_iterations=2):
             # Forward with Modern AMP
             with torch.amp.autocast('cuda'):
                 # V3 Model returns: logits, avg_iters, avg_energy, layer_energies
-                out = model(x, local_iterations=local_iterations)
+                out = model(x, local_iters=local_iterations)
                 if isinstance(out, tuple):
                     logits, avg_iters, avg_energy, _ = out
                 else:
@@ -72,18 +72,21 @@ def train_ppc_sharded(model, dataloader, lr=1e-4, epochs=1, local_iterations=2):
             if step % 50 == 0:
                 torch.cuda.empty_cache()
             
-            # Logging
+            # Logging — batch all .item() / CPU syncs here, never in the hot path above
             if step % 10 == 0:
-                ppl = torch.exp(loss).item()
+                loss_val   = loss.item()   # single GPU→CPU sync; triggers just once per 10 steps
+                ppl        = torch.exp(loss).item()
+                energy_val = avg_energy.item() if isinstance(avg_energy, torch.Tensor) else avg_energy
                 throughput = (B * T) / (time.time() - start_time)
-                wandb.log({
-                    "train/loss": loss.item(),
-                    "train/ppl": ppl,
-                    "train/tokens_per_sec": throughput,
-                    "train/step": step,
-                    "train/energy": avg_energy.item() if isinstance(avg_energy, torch.Tensor) else avg_energy,
-                    "train/avg_iters": avg_iters,
-                })
-                pbar.set_postfix({"loss": f"{loss.item():.4f}", "E": f"{float(avg_energy):.3f}"})
+                if wandb.run is not None:
+                    wandb.log({
+                        "train/loss": loss_val,
+                        "train/ppl": ppl,
+                        "train/tokens_per_sec": throughput,
+                        "train/step": step,
+                        "train/energy": energy_val,
+                        "train/avg_iters": avg_iters,
+                    })
+                pbar.set_postfix({"loss": f"{loss_val:.4f}", "E": f"{energy_val:.3f}"})
 
     print("\nTraining Complete.")

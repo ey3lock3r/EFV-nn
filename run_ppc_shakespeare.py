@@ -118,7 +118,7 @@ def run_epoch(model, loader, optimizer, device, train=True, step_limit=None):
             if step_limit and step >= step_limit:
                 break
             x, y = x.to(device), y.to(device)
-            logits = model(x, local_iterations=LOCAL_ITERS)                            # [B, T, V]
+            logits, _, _, _ = model(x, local_iters=LOCAL_ITERS)                         # [B, T, V]
             B, T, V = logits.shape
             loss = F.cross_entropy(logits.reshape(B * T, V), y.reshape(B * T))
 
@@ -144,7 +144,7 @@ def sample(model, dataset, seed_text="ROMEO:", length=200, device="cpu"):
     ids = torch.tensor([dataset.stoi.get(c, 0) for c in seed_text], dtype=torch.long).unsqueeze(0).to(device)
     generated = list(seed_text)
     for _ in range(length):
-        logits = model(ids[:, -SEQ_LEN:])                   # [1, T, V]
+        logits, _, _, _ = model(ids[:, -SEQ_LEN:])          # [1, T, V]
         probs  = F.softmax(logits[:, -1, :] / 0.8, dim=-1) # temperature=0.8
         next_id = torch.multinomial(probs, 1)
         ids = torch.cat([ids, next_id], dim=1)

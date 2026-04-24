@@ -125,8 +125,11 @@ class PPCNodeLayer(nn.Module):
             B, T, D, _ = x_stream.shape
             iters_run = 0
 
-            # Pillar 1: Compute Spectral Routing Bias once per layer
-            gate_bias = self.spectral_gate(x_stream) if hasattr(self, 'spectral_gate') else None
+            # Pillar 1: Compute Spectral Routing Bias once per layer.
+            # Honour externally provided gate_bias (e.g. from SpectralShardedPPCGraphLLM);
+            # only compute internally when none was passed in.
+            if gate_bias is None:
+                gate_bias = self.spectral_gate(x_stream) if hasattr(self, 'spectral_gate') else None
 
             # --- PHASE 1: TARGET CONSTRUCTION (STATIONARY TARGET) ---
             # To enable Anderson Acceleration, the target must not move during the micro-iterations.
@@ -159,7 +162,7 @@ class PPCNodeLayer(nn.Module):
                 x_target[:, 0, :, :] = x_stream[:, 0, :, :]
 
             # --- DEQ Callables ---
-            def f_forward_step(x, x_init, g_bias, target):
+            def f_forward_step(x, _x_init, g_bias, target):
                 B, T, D, _ = x.shape
                 # Hybrid Bridge: Use Triton for Forward Speed, PyTorch for Gradient Connectivity
                 use_triton_now = self._triton_available and not torch.is_grad_enabled()
@@ -190,18 +193,19 @@ class PPCNodeLayer(nn.Module):
                 return x + update
 
             def f_solver(x_init, g_bias, target):
-                # APD Relaxation: Dynamic tolerance allows early exit during high-energy phases (Phase 0)
-                base_tol_sq = self.exit_threshold.item() ** 2
+                # APD Relaxation: Dynamic tolerance allows early exit during high-energy phases (Phase 0).
+                # tol is compared directly against res_norm (L2 norm), not its square.
+                base_tol = self.exit_threshold.item()
                 if rolling_energy is not None:
-                    # 0.1 multiplier is conservative; 0.05 is standard for phasal locking
-                    dynamic_tol_sq = max(base_tol_sq, (rolling_energy * 0.05) ** 2)
+                    # 0.05 multiplier: standard for phasal locking; relaxes exit in Phase 0
+                    dynamic_tol = max(base_tol, rolling_energy * 0.05)
                 else:
-                    dynamic_tol_sq = base_tol_sq
+                    dynamic_tol = base_tol
 
                 return anderson_acceleration(
-                    lambda x: f_forward_step(x, x_init, g_bias, target), 
-                    x_init, 
-                    m=5, max_iter=local_iters, tol=dynamic_tol_sq
+                    lambda x: f_forward_step(x, x_init, g_bias, target),
+                    x_init,
+                    m=5, max_iter=local_iters, tol=dynamic_tol
                 )
 
             # Ensure Adjoint Cache matches the current stream shape for warm-starting
@@ -214,7 +218,7 @@ class PPCNodeLayer(nn.Module):
             layer_params = [p for p in self.parameters() if p.requires_grad]
             
             out, iters_run, res_norm = DEQFunction.apply(
-                x_stream, f_solver, f_forward_step, gate_bias, x_target, self.moe.cache_weights, self.moe.clear_cache, self._adjoint_cache, *layer_params
+                x_stream, f_solver, f_forward_step, gate_bias, x_target, self.moe.cache_weights, self.moe.clear_cache, self._adjoint_cache, [self.moe], *layer_params
             )
 
         if unbatched:
@@ -259,13 +263,12 @@ class PPCGraphLLM(nn.Module):
         x = self.embed(input_ids)            # [B, T, D, 2]
 
         total_iters = 0
-        res_energies = []
-        for layer in self.layers:
+        layer_energies = torch.empty(len(self.layers), device=x.device, dtype=torch.float32)
+        for i, layer in enumerate(self.layers):
             x, iters, res_norm = layer(x, local_iters, rolling_energy=rolling_energy)
             total_iters += iters
-            res_energies.append(res_norm.clone())
+            layer_energies[i] = res_norm
 
-        layer_energies = torch.stack(res_energies)
         avg_energy = layer_energies.mean()
 
         # Flatten [..., D, 2] to [..., 2D] for decoder

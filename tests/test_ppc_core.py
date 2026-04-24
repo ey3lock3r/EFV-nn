@@ -2,11 +2,11 @@
 Unit tests for the Prospective Predictive Coding (PPC) components.
 
 Covers:
-  - UnitaryInitializer: variance bounds, shape, complex dtype
-  - complex_activation (modReLU): magnitude clamping, phase preservation
-  - ExpertChoiceMoEMatcher: routing balance, output shape
-  - PPCNodeLayer: local loss reduction over iterations
-  - PPCGraphLLM: end-to-end forward pass shape and dtype
+  - ComplexKaimingInitializer: shape, phase bounds, variance, fan_in logic
+  - complex_activation (ComplexGELU): output shape, non-negative magnitude
+  - ExpertChoiceMoEMatcher: routing coverage, output shape
+  - PPCNodeLayer: output shape, no-NaN
+  - PPCGraphLLM: end-to-end forward pass shape, no-NaN, gradient flow
 """
 import sys
 from pathlib import Path
@@ -17,12 +17,16 @@ import pytest
 import torch
 import torch.nn as nn
 
-from efv_nn.ppc_core import UnitaryInitializer, complex_activation, ExpertChoiceMoEMatcher
+from efv_nn.ppc_core import (
+    UnitaryInitializer, ComplexKaimingInitializer,
+    complex_activation, ExpertChoiceMoEMatcher,
+)
 from efv_nn.ppc_gnn import PPCNodeLayer, PPCGraphLLM
+from efv_nn.deq_solvers import anderson_acceleration
 
 
 # ---------------------------------------------------------------------------
-# UnitaryInitializer
+# ComplexKaimingInitializer (canonical) — also tested via UnitaryInitializer alias
 # ---------------------------------------------------------------------------
 
 class TestUnitaryInitializer:
@@ -72,9 +76,28 @@ class TestUnitaryInitializer:
         assert 0.1 * expected < mag_std < 10 * expected, \
             f"Magnitude std={mag_std:.4f} far from expected ~{expected:.4f}"
 
+    def test_fan_in_2d_uses_second_to_last_dim(self):
+        """For a 2D shape (rows, cols) fan_in == cols (shape[-2])."""
+        # Arrange — shape (32, 64): fan_in should be 32 not 64
+        W_wide = ComplexKaimingInitializer.initialize((32, 64))
+        W_tall = ComplexKaimingInitializer.initialize((64, 32))
+        # Act — wider matrix (larger fan_in=32) should have smaller scale
+        std_wide = torch.norm(W_wide, dim=-1).std().item()
+        std_tall = torch.norm(W_tall, dim=-1).std().item()
+        # Assert — fan_in=32 → scale 1/√32 ≈ 0.177; fan_in=64 → 1/√64 = 0.125
+        assert std_wide > std_tall, (
+            f"Expected wider matrix (fan_in=32) to have larger std than "
+            f"tall (fan_in=64): {std_wide:.4f} vs {std_tall:.4f}"
+        )
+
+    def test_1d_shape(self):
+        """1D shape initializes without error and has correct last dim."""
+        W = ComplexKaimingInitializer.initialize((64,))
+        assert W.shape == (64, 2)
+
 
 # ---------------------------------------------------------------------------
-# complex_activation (modReLU)
+# complex_activation (ComplexGELU — independent real/imag)
 # ---------------------------------------------------------------------------
 
 class TestComplexActivation:
@@ -89,29 +112,93 @@ class TestComplexActivation:
         assert out.shape[-1] == 2
 
     def test_magnitude_non_negative(self):
-        """Activated magnitudes must be >= 0."""
+        """GELU output magnitude must be >= 0 (GELU can output negative values,
+        so this tests that magnitudes are geometric norms, not activations themselves)."""
         # Arrange
-        x = torch.randn(16, 16, 2)
+        x = torch.randn(16, 16, 2) * 5  # large values exercise clamping region
         # Act
         out = complex_activation(x)
         # Assert
         mag = torch.norm(out, dim=-1)
         assert (mag >= 0).all(), "All magnitudes should be non-negative"
 
-    def test_phase_preserved(self):
-        """modReLU only kills magnitude, not direction."""
+    def test_applies_gelu_independently(self):
+        """ComplexGELU applies GELU to each component independently (not magnitude)."""
+        import torch.nn.functional as F
         # Arrange
-        phase = torch.tensor(0.5)
-        x_r = 100.0 * torch.cos(phase)
-        x_i = 100.0 * torch.sin(phase)
-        x = torch.stack([x_r, x_i], dim=-1).expand(4, 4, 2)
+        x = torch.randn(4, 8, 2)
         # Act
         out = complex_activation(x)
-        # Assert: angle difference should be negligible
-        out_angle = torch.atan2(out[..., 1], out[..., 0])
-        x_angle = torch.atan2(x[..., 1], x[..., 0])
-        angle_diff = (out_angle - x_angle).abs().max().item()
-        assert angle_diff < 0.05, f"Phase deviation too large: {angle_diff}"
+        # Assert: each component equals F.gelu of that component
+        assert torch.allclose(out[..., 0], F.gelu(x[..., 0]), atol=1e-6)
+        assert torch.allclose(out[..., 1], F.gelu(x[..., 1]), atol=1e-6)
+
+    def test_shape_preserved(self):
+        """Output shape must equal input shape."""
+        # Arrange
+        shapes = [(4, 8, 2), (2, 16, 32, 2), (100, 2)]
+        for shape in shapes:
+            x = torch.randn(*shape)
+            # Act / Assert
+            assert complex_activation(x).shape == x.shape, f"Shape mismatch for {shape}"
+
+
+# ---------------------------------------------------------------------------
+# Anderson Acceleration
+# ---------------------------------------------------------------------------
+
+class TestAndersonAcceleration:
+    def test_converges_on_linear_system(self):
+        """Anderson must converge on a simple contractive linear map x = Ax + b."""
+        # Arrange — f(x) = 0.5*x + c  has fixed point x* = 2c
+        torch.manual_seed(0)
+        B, T, D = 1, 4, 8
+        c = torch.ones(B, T, D, 2) * 0.5
+
+        def f(x):
+            return 0.5 * x + c
+
+        x0 = torch.zeros(B, T, D, 2)
+        x_star_expected = 2 * c  # analytical fixed point
+
+        # Act
+        x_star, iters, res_norm = anderson_acceleration(f, x0, m=5, max_iter=50, tol=1e-6)
+
+        # Assert
+        assert torch.allclose(x_star, x_star_expected, atol=1e-4), \
+            f"Did not converge to fixed point. Max err: {(x_star - x_star_expected).abs().max()}"
+        assert res_norm.item() < 1e-4
+
+    def test_nan_siphon_prevents_cascade(self):
+        """NaN in first f(x0) must not poison subsequent iterations."""
+        # Arrange — f returns NaN on first call, then a valid contractive function
+        torch.manual_seed(1)
+        B, T, D = 1, 4, 8
+        call_count = [0]
+
+        def f_nan_first(x):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return torch.full_like(x, float('nan'))
+            return 0.5 * x  # converges to x*=0
+
+        x0 = torch.randn(B, T, D, 2) * 0.1
+
+        # Act
+        x_out, iters, res_norm = anderson_acceleration(f_nan_first, x0, m=5, max_iter=20, tol=1e-4)
+
+        # Assert — no NaN in output and the solver continued
+        assert not torch.isnan(x_out).any(), "NaN cascade not stopped by siphon"
+        assert iters > 1
+
+    def test_returns_correct_shapes(self):
+        """Return shapes must match: x [B,T,D,2], iters scalar, res_norm scalar."""
+        B, T, D = 2, 8, 16
+        x0 = torch.zeros(B, T, D, 2)
+        x_out, iters, res_norm = anderson_acceleration(lambda x: 0.5 * x, x0, m=3, max_iter=5, tol=1.0)
+        assert x_out.shape == (B, T, D, 2)
+        assert isinstance(iters, int)
+        assert res_norm.ndim == 0  # scalar tensor
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +265,55 @@ class TestPPCNodeLayer:
         # Assert
         assert not torch.isnan(out).any(), "NaN in output"
 
+    def test_apd_exits_early_with_high_rolling_energy(self):
+        """High rolling_energy relaxes the tolerance — APD must exit before max_iter."""
+        # Arrange
+        torch.manual_seed(0)
+        layer = PPCNodeLayer(hidden_dim=16, prime_delays=[])
+        x = torch.randn(1, 8, 16, 2)
+        max_iters = 20
+
+        # Act — high rolling_energy → dynamic_tol = 100*0.05 = 5.0 (very loose)
+        _, iters_relaxed, _ = layer(x, local_iters=max_iters, rolling_energy=100.0)
+        # Act — zero rolling_energy → tight tolerance from learnable exit_threshold
+        _, iters_tight, _ = layer(x, local_iters=max_iters, rolling_energy=0.0)
+
+        # Assert — relaxed should exit strictly earlier than tight
+        assert iters_relaxed < iters_tight, (
+            f"APD relaxation not working: relaxed={iters_relaxed} >= tight={iters_tight}"
+        )
+
+    def test_external_gate_bias_not_overwritten(self):
+        """An externally provided gate_bias must be used, not overridden by the layer."""
+        # Arrange
+        torch.manual_seed(5)
+        hidden_dim, num_experts = 16, 4
+        layer = PPCNodeLayer(hidden_dim=hidden_dim, num_experts=num_experts, prime_delays=[])
+        B, T = 1, 8
+        x = torch.randn(B, T, hidden_dim, 2)
+
+        # A clearly non-zero external bias — if ignored the routing would differ
+        sentinel_bias = torch.ones(B * T, num_experts) * 1000.0
+
+        # Capture what gate_bias is actually used inside f_forward_step
+        captured = {}
+        original_get_indices = layer.moe.get_indices
+
+        def patched_get_indices(x_in, gate_bias=None):
+            captured['gate_bias'] = gate_bias
+            return original_get_indices(x_in, gate_bias=gate_bias)
+
+        layer.moe.get_indices = patched_get_indices
+
+        # Act
+        with torch.no_grad():
+            layer(x, local_iters=2, gate_bias=sentinel_bias)
+
+        # Assert
+        assert captured.get('gate_bias') is not None, "gate_bias was None — external bias dropped"
+        assert torch.allclose(captured['gate_bias'], sentinel_bias), \
+            "gate_bias was overwritten with internally computed value"
+
 
 # ---------------------------------------------------------------------------
 # PPCGraphLLM — End-to-End
@@ -185,11 +321,11 @@ class TestPPCNodeLayer:
 
 class TestPPCGraphLLM:
     def _make_model(self, vocab_size=10, hidden_dim=32, num_layers=2, local_lr=0.5):
-        return PPCGraphLLM(vocab_size=vocab_size, hidden_dim=hidden_dim, 
+        return PPCGraphLLM(vocab_size=vocab_size, hidden_dim=hidden_dim,
                            num_layers=num_layers, local_lr=local_lr)
 
-    def test_logits_shape(self):
-        """Logits must be [seq_len, vocab_size]."""
+    def test_logits_shape_unbatched(self):
+        """Unbatched: logits must be [T, vocab_size]."""
         # Arrange
         vocab_size, seq_len = 10, 16
         model = self._make_model(vocab_size=vocab_size)
@@ -199,6 +335,19 @@ class TestPPCGraphLLM:
         # Assert
         assert logits.shape == (seq_len, vocab_size), \
             f"Expected ({seq_len}, {vocab_size}), got {logits.shape}"
+
+    def test_logits_shape_batched(self):
+        """Batched: logits must be [B, T, vocab_size]."""
+        # Arrange
+        vocab_size, B, seq_len = 10, 3, 16
+        model = self._make_model(vocab_size=vocab_size)
+        input_ids = torch.randint(0, vocab_size, (B, seq_len))
+        # Act
+        logits, avg_iters, avg_energy, layer_energies = model(input_ids, local_iters=2)
+        # Assert
+        assert logits.shape == (B, seq_len, vocab_size), \
+            f"Expected ({B}, {seq_len}, {vocab_size}), got {logits.shape}"
+        assert layer_energies.shape == (2,)  # num_layers
 
     def test_no_nan_in_logits(self):
         """Logits must contain no NaN after a forward pass."""
@@ -212,7 +361,7 @@ class TestPPCGraphLLM:
         assert not torch.isnan(logits).any(), "NaN detected in model logits"
 
     def test_loss_decreases_over_epochs(self):
-        """Basic sanity-check for gradient flow."""
+        """Basic sanity-check for gradient flow through IFT backward."""
         # Arrange
         torch.manual_seed(0)
         vocab_size, seq_len = 10, 16
@@ -241,3 +390,95 @@ class TestPPCGraphLLM:
         assert final_loss < initial_loss, (
             f"Loss did not decrease: initial={initial_loss:.4f}, final={final_loss:.4f}"
         )
+
+    def test_moe_cache_cleared_after_forward(self):
+        """FP32 MoE weight cache must be None after each forward (no 25 GB leak)."""
+        # Arrange
+        torch.manual_seed(2)
+        model = self._make_model()
+        input_ids = torch.randint(0, 10, (1, 8))
+
+        # Act
+        with torch.no_grad():
+            model(input_ids, local_iters=3)
+
+        # Assert — cache must be cleaned up by cleanup_fn
+        for layer in model.layers:
+            assert layer.moe._wr_f32 is None, "FP32 weight cache not cleared — memory leak"
+
+    def test_expert_weight_grad_flows(self):
+        """Expert weight parameters must receive non-zero gradients after backward."""
+        # Arrange
+        torch.manual_seed(3)
+        model = self._make_model(vocab_size=10, hidden_dim=16, num_layers=1)
+        input_ids = torch.randint(0, 10, (1, 8))
+        target = torch.randint(0, 10, (1, 8))
+
+        # Act
+        logits, _, _, _ = model(input_ids, local_iters=3)
+        loss = nn.CrossEntropyLoss()(logits.reshape(-1, 10), target.reshape(-1))
+        loss.backward()
+
+        # Assert
+        grad = model.layers[0].moe.experts_weight_real.grad
+        assert grad is not None, "No gradient on expert weights"
+        assert grad.norm().item() > 0, "Expert weight gradient is zero"
+
+
+# ---------------------------------------------------------------------------
+# ShardedPPCGraphLLM — CPU single-GPU smoke tests
+# ---------------------------------------------------------------------------
+
+class TestShardedPPCGraphLLM:
+    """Tests ShardedPPCGraphLLM on CPU (single-GPU sharding collapses to cuda:0==cuda:1 or cpu)."""
+
+    def _make_model(self, vocab_size=10, hidden_dim=32, num_layers=2):
+        from efv_nn.ppc_sharded import ShardedPPCGraphLLM
+        return ShardedPPCGraphLLM(
+            vocab_size=vocab_size, hidden_dim=hidden_dim,
+            num_layers=num_layers, num_experts=4,
+            prime_delays=[1, 2], use_triton=False,
+        )
+
+    def test_forward_output_shapes(self):
+        """Forward must return logits [B, T, V], scalar avg_iters, scalar avg_energy."""
+        # Arrange
+        vocab_size, B, T = 10, 2, 8
+        model = self._make_model(vocab_size=vocab_size)
+        input_ids = torch.randint(0, vocab_size, (B, T))
+
+        # Act
+        logits, avg_iters, avg_energy, layer_energies = model(input_ids, local_iters=2)
+
+        # Assert
+        assert logits.shape == (B, T, vocab_size)
+        assert layer_energies.shape == (2,)
+        assert isinstance(avg_iters, float)
+
+    def test_generate_single_batch(self):
+        """generate must work for B=1 and return tokens including prompt."""
+        # Arrange
+        vocab_size = 20
+        model = self._make_model(vocab_size=vocab_size)
+        input_ids = torch.randint(0, vocab_size, (1, 5))
+
+        # Act
+        with torch.no_grad():
+            out = model.generate(input_ids, max_new_tokens=4, local_iters=2)
+
+        # Assert
+        assert out.shape[0] == 1
+        assert out.shape[1] >= 5  # at least the prompt
+        assert out.shape[1] <= 9  # at most prompt + 4
+
+    def test_generate_batched_no_crash(self):
+        """generate must work for B > 1 (EOS .item() crash regression)."""
+        # Arrange
+        vocab_size = 20
+        model = self._make_model(vocab_size=vocab_size)
+        input_ids = torch.randint(0, vocab_size, (3, 5))  # B=3
+
+        # Act / Assert — must not raise RuntimeError
+        with torch.no_grad():
+            out = model.generate(input_ids, max_new_tokens=3, local_iters=2)
+        assert out.shape[0] == 3

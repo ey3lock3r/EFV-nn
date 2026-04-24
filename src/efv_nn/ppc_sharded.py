@@ -3,8 +3,13 @@ import torch.nn as nn
 import os
 from efv_nn import diagnostics
 from torch.utils.checkpoint import checkpoint
-import bitsandbytes.nn as bnb_nn
 from efv_nn import ppc_gnn, ppc_core
+
+try:
+    import bitsandbytes.nn as bnb_nn
+    _BNB_AVAILABLE = True
+except ImportError:
+    _BNB_AVAILABLE = False
 
 class ShardedPPCGraphLLM(nn.Module):
     def __init__(self, vocab_size: int, hidden_dim: int = 1024, num_layers: int = 24,
@@ -23,7 +28,7 @@ class ShardedPPCGraphLLM(nn.Module):
         # Cache device objects to avoid string comparisons in the hot loop
         self.d0 = torch.device(self.device0)
         self.d1 = torch.device(self.device1)
-        
+
         # 1. Sharded Embeddings (GPU 0) - stores interleaved real [V, D, 2]
         self.embedding = nn.Embedding(vocab_size, hidden_dim * 2).to(self.d0)
 
@@ -63,26 +68,24 @@ class ShardedPPCGraphLLM(nn.Module):
         x = self.embed(input_ids) # [B, T, D, 2]
 
         total_iters = 0
-        res_energies = []
+        # Pre-allocate energy tensor on d1 to avoid per-layer to() calls and list + stack
+        layer_energies = torch.empty(self.num_layers, device=self.d1, dtype=torch.float32)
         for i, layer in enumerate(self.layers):
             target_device = self.layer_target_devices[i]
-            
+
             # Optimized Zero-G Guard: Comparison of device objects is much faster than strings
             if x.device != target_device:
                 x = x.to(target_device)
-            
+
             x, iters, res_norm = layer(x, local_iters, rolling_energy=rolling_energy)
 
             # Isolation: Prevent CUDA Graph buffer overwrite in loops
-            # We use a non-blocking clone if possible, but standard clone is safe.
-            x = x.clone() 
+            x = x.clone()
             total_iters += iters.item()
-            res_energies.append(res_norm.clone())
+            layer_energies[i] = res_norm.to(self.d1)
 
-        # Move all scalars to device1 before sum to avoid cross-device error
-        layer_energies = torch.stack([e.to(self.d1) for e in res_energies])
         avg_energy = layer_energies.mean()
-        
+
         diagnostics.debug_print_nan(avg_energy, "avg_energy")
 
         # Final decoding on device1
@@ -96,95 +99,106 @@ class ShardedPPCGraphLLM(nn.Module):
         """
         Execute parallel ghost-state convergence to find the lowest-energy resonance.
         """
-        input_ids = input_ids.to(self.device0)
+        input_ids = input_ids.to(self.d0)
         # 1. Embed and Expand into Swarm
         x = self.embed(input_ids) # [B, T, D, 2]
         B, T, D, _ = x.shape
-        
+
         # x_swarm: [B * S, T, D, 2]
         x_swarm = x.repeat_interleave(swarm_size, dim=0)
-        
+
         # 2. Phase Perturbation: Add tiny noise to phase ghosts
-        # Using 1e-4 noise to keep ghosts near the embedding but allow separate search paths
         x_swarm[..., 1] += torch.randn_like(x_swarm[..., 1]) * 1e-4
 
         total_iters = 0
-        res_energies = torch.zeros(B * swarm_size, device=self.device1)
-        
         curr_x = x_swarm
         for i, layer in enumerate(self.layers):
             if i == self.split_point:
-                curr_x = curr_x.to(self.device1)
-            
+                curr_x = curr_x.to(self.d1)
+
             curr_x, iters, res_norm = layer(curr_x, local_iters)
             curr_x = curr_x.clone() # Isolation: Prevent CUDA Graph buffer overwrite in loops
-            # res_norm is usually scalar mean, but for swarm we need per-sample
-            # In swarm mode, we'll re-calculate norm locally for selection
             total_iters += iters.item()
 
         # 3. Resonance Selection (Pick the ghost with the deepest convergence)
         # Reshape to [B, S, T, D, 2]
         curr_x = curr_x.reshape(B, swarm_size, T, D, 2)
-        
+
         # Calculate Energy per Ghost [B, S]
-        # We look at the final phasal stability of each ghost
-        # curr_x[..., 1] is [B, S, T, D]
-        final_energy = torch.norm(curr_x[..., 1], dim=(-2, -1)) # Result: [B, S]
-        
+        final_energy = torch.norm(curr_x[..., 1], dim=(-2, -1)) # [B, S]
+
         winner_indices = torch.argmin(final_energy, dim=1) # [B]
-        
-        # Gather Winners [B, T, D, 2]
-        winners = torch.stack([curr_x[b, winner_indices[b]] for b in range(B)], dim=0)
-        
+
+        # Vectorized gather — no Python loop over B
+        winners = curr_x[torch.arange(B, device=curr_x.device), winner_indices]  # [B, T, D, 2]
+
         x_flat = winners.flatten(-2)
         logits = self.output_head(self.layer_norm(x_flat))
-        
-        # Return winner's mean energy as the 3rd value
-        winner_energy = final_energy[0, winner_indices[0]].item() 
-        
+
+        # Keep on GPU until caller explicitly needs a scalar
+        winner_energy = final_energy[torch.arange(B, device=final_energy.device), winner_indices].mean().item()
+
         return logits, total_iters / self.num_layers, winner_energy
 
     @torch.no_grad()
     def generate_swarm(self, input_ids: torch.Tensor, max_new_tokens: int = 50, swarm_size: int = 8, local_iters: int = 16, temperature: float = 1.0, top_k: int = 40):
         device = input_ids.device
-        for _ in range(max_new_tokens):
-            logits, _, _ = self.swarm_forward(input_ids, swarm_size=swarm_size, local_iters=local_iters)
+        # Pre-allocate output buffer to avoid O(n²) torch.cat growth
+        B, T0 = input_ids.shape
+        out = torch.empty(B, T0 + max_new_tokens, dtype=input_ids.dtype, device=device)
+        out[:, :T0] = input_ids
+        generated = T0
+
+        for step in range(max_new_tokens):
+            logits, _, _ = self.swarm_forward(out[:, :generated], swarm_size=swarm_size, local_iters=local_iters)
             next_token_logits = logits[:, -1, :] / max(1e-6, temperature)
-            
+
             # Top-K Sampling to prevent greedy repetition
             if top_k > 0:
-                indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
+                k = min(top_k, next_token_logits.size(-1))
+                indices_to_remove = next_token_logits < torch.topk(next_token_logits, k)[0][..., -1, None]
                 next_token_logits[indices_to_remove] = -float('Inf')
-            
+
             probs = torch.nn.functional.softmax(next_token_logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
-            
-            input_ids = torch.cat([input_ids, next_token.to(device)], dim=1)
-            
-            if next_token.item() == 128001:
+
+            out[:, generated] = next_token[:, 0]
+            generated += 1
+
+            if (next_token[:, 0] == 128001).all():
                 break
-        return input_ids
+
+        return out[:, :generated]
 
     @torch.no_grad()
     def generate(self, input_ids: torch.Tensor, max_new_tokens: int = 50, local_iters: int = 8, temperature: float = 1.0, top_k: int = 40):
         device = input_ids.device
-        for _ in range(max_new_tokens):
-            logits, _, _, _ = self.forward(input_ids, local_iters=local_iters)
+        # Pre-allocate output buffer to avoid O(n²) torch.cat growth
+        B, T0 = input_ids.shape
+        out = torch.empty(B, T0 + max_new_tokens, dtype=input_ids.dtype, device=device)
+        out[:, :T0] = input_ids
+        generated = T0
+
+        for step in range(max_new_tokens):
+            logits, _, _, _ = self.forward(out[:, :generated], local_iters=local_iters)
             next_token_logits = logits[:, -1, :] / max(1e-6, temperature)
-            
+
             # Top-K Sampling
             if top_k > 0:
-                indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
+                k = min(top_k, next_token_logits.size(-1))
+                indices_to_remove = next_token_logits < torch.topk(next_token_logits, k)[0][..., -1, None]
                 next_token_logits[indices_to_remove] = -float('Inf')
-                
+
             probs = torch.nn.functional.softmax(next_token_logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
-            
-            input_ids = torch.cat([input_ids, next_token.to(device)], dim=1)
-            
-            if next_token.item() == 128001:
+
+            out[:, generated] = next_token[:, 0]
+            generated += 1
+
+            if (next_token[:, 0] == 128001).all():
                 break
-        return input_ids
+
+        return out[:, :generated]
 
     @property
     def total_params(self):
