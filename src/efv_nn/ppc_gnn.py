@@ -29,8 +29,8 @@ def spectral_guardian_penalty(layer_energies: torch.Tensor, lam: float = 0.01) -
     Returns:
         Scalar penalty tensor on the same device. Zero graph breaks.
     """
-    diff = layer_energies[1:] - layer_energies[:-1]  # [num_layers - 1]
-    return lam * (diff ** 2).sum()
+    ratio = layer_energies[1:] / (layer_energies[:-1].clamp(min=1e-8))
+    return lam * ((ratio - 1.0) ** 2).sum()
 
 
 class PPCNodeLayer(nn.Module):
@@ -284,9 +284,10 @@ class PPCGraphLLM(nn.Module):
             total_aux_loss = total_aux_loss + aux_loss
 
         avg_energy = layer_energies.mean()
+        sg_penalty = spectral_guardian_penalty(layer_energies, lam=0.01)
 
         # Flatten [..., D, 2] to [..., 2D] for decoder
         x_flat = x.flatten(-2)
         x_norm = self.layer_norm(x_flat)
         logits = self.output_head(x_norm)
-        return logits, total_iters / len(self.layers), avg_energy, layer_energies, total_aux_loss
+        return logits, total_iters / len(self.layers), avg_energy, layer_energies, total_aux_loss, sg_penalty

@@ -330,7 +330,7 @@ class TestPPCGraphLLM:
         model = self._make_model(vocab_size=vocab_size)
         input_ids = torch.arange(seq_len) % vocab_size
         # Act
-        logits, _, _, _, _ = model(input_ids, local_iters=2)
+        logits, _, _, _, _, _ = model(input_ids, local_iters=2)
         # Assert
         assert logits.shape == (seq_len, vocab_size), \
             f"Expected ({seq_len}, {vocab_size}), got {logits.shape}"
@@ -342,7 +342,7 @@ class TestPPCGraphLLM:
         model = self._make_model(vocab_size=vocab_size)
         input_ids = torch.randint(0, vocab_size, (B, seq_len))
         # Act
-        logits, avg_iters, avg_energy, layer_energies, aux_loss = model(input_ids, local_iters=2)
+        logits, avg_iters, avg_energy, layer_energies, aux_loss, sg_penalty = model(input_ids, local_iters=2)
         # Assert
         assert logits.shape == (B, seq_len, vocab_size), \
             f"Expected ({B}, {seq_len}, {vocab_size}), got {logits.shape}"
@@ -355,7 +355,7 @@ class TestPPCGraphLLM:
         model = self._make_model()
         input_ids = torch.randint(0, 10, (12,))
         # Act
-        logits, _, _, _, _ = model(input_ids)
+        logits, _, _, _, _, _ = model(input_ids)
         # Assert
         assert not torch.isnan(logits).any(), "NaN detected in model logits"
 
@@ -372,7 +372,7 @@ class TestPPCGraphLLM:
         criterion = nn.CrossEntropyLoss()
 
         def compute_loss():
-            logits, _, _, _, _ = model(input_ids)
+            logits, _, _, _, _, _ = model(input_ids)
             return criterion(logits[:-1], target_ids[:-1])
 
         # Act
@@ -414,7 +414,7 @@ class TestPPCGraphLLM:
         target = torch.randint(0, 10, (1, 8))
 
         # Act
-        logits, _, _, _, _ = model(input_ids, local_iters=3)
+        logits, _, _, _, _, _ = model(input_ids, local_iters=3)
         loss = nn.CrossEntropyLoss()(logits.reshape(-1, 10), target.reshape(-1))
         loss.backward()
 
@@ -447,7 +447,7 @@ class TestShardedPPCGraphLLM:
         input_ids = torch.randint(0, vocab_size, (B, T))
 
         # Act
-        logits, avg_iters, avg_energy, layer_energies, aux_loss = model(input_ids, local_iters=2)
+        logits, avg_iters, avg_energy, layer_energies, aux_loss, sg_penalty = model(input_ids, local_iters=2)
 
         # Assert
         assert logits.shape == (B, T, vocab_size)
@@ -508,12 +508,40 @@ class TestMoELoadBalance:
         assert aux_loss.item() == 0.0
 
     def test_ppcgraphllm_returns_aux_loss(self):
-        """PPCGraphLLM.forward must return 5-tuple including scalar aux_loss."""
+        """PPCGraphLLM.forward must return 6-tuple including scalar aux_loss."""
         from efv_nn.ppc_gnn import PPCGraphLLM
         model = PPCGraphLLM(vocab_size=10, hidden_dim=32, num_layers=2)
         ids = torch.randint(0, 10, (2, 8))
         out = model(ids, local_iters=2)
-        assert len(out) == 5, f"Expected 5-tuple, got {len(out)}"
-        logits, avg_iters, avg_energy, layer_energies, aux_loss = out
+        assert len(out) == 6, f"Expected 6-tuple, got {len(out)}"
+        logits, avg_iters, avg_energy, layer_energies, aux_loss, sg_penalty = out
         assert aux_loss.ndim == 0
         assert aux_loss.item() >= 0.0
+
+
+class TestSpectralGuardian:
+    def test_penalty_is_scalar_and_nonneg(self):
+        """spectral_guardian_penalty must return a non-negative scalar."""
+        from efv_nn.ppc_gnn import spectral_guardian_penalty
+        energies = torch.tensor([0.5, 0.3, 0.4, 0.1])
+        p = spectral_guardian_penalty(energies, lam=0.01)
+        assert p.ndim == 0
+        assert p.item() >= 0.0
+
+    def test_penalty_zero_for_flat_energies(self):
+        """Constant energy across layers should produce zero penalty."""
+        from efv_nn.ppc_gnn import spectral_guardian_penalty
+        energies = torch.ones(6) * 0.5
+        p = spectral_guardian_penalty(energies, lam=0.01)
+        assert p.item() < 1e-6
+
+    def test_ppcgraphllm_returns_guardian_penalty(self):
+        """PPCGraphLLM.forward must return 6-tuple including spectral_guardian_penalty."""
+        from efv_nn.ppc_gnn import PPCGraphLLM
+        model = PPCGraphLLM(vocab_size=10, hidden_dim=32, num_layers=2)
+        ids = torch.randint(0, 10, (2, 8))
+        out = model(ids, local_iters=2)
+        assert len(out) == 6, f"Expected 6-tuple, got {len(out)}"
+        *_, aux_loss, sg_penalty = out
+        assert sg_penalty.ndim == 0
+        assert sg_penalty.item() >= 0.0

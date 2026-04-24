@@ -87,6 +87,7 @@ class ShardedPPCGraphLLM(nn.Module):
             total_aux_loss = total_aux_loss + aux_loss.to(self.d1)
 
         avg_energy = layer_energies.mean()
+        sg_penalty = ppc_gnn.spectral_guardian_penalty(layer_energies, lam=0.01)
 
         diagnostics.debug_print_nan(avg_energy, "avg_energy")
 
@@ -94,7 +95,7 @@ class ShardedPPCGraphLLM(nn.Module):
         x_flat = x.flatten(-2) # [..., 2D]
         x_norm = self.layer_norm(x_flat)
         logits = self.output_head(x_norm)
-        return logits, total_iters / self.num_layers, avg_energy, layer_energies, total_aux_loss
+        return logits, total_iters / self.num_layers, avg_energy, layer_energies, total_aux_loss, sg_penalty
 
     @torch.no_grad()
     def swarm_forward(self, input_ids: torch.Tensor, swarm_size: int = 8, local_iters: int = 16):
@@ -182,7 +183,7 @@ class ShardedPPCGraphLLM(nn.Module):
         generated = T0
 
         for step in range(max_new_tokens):
-            logits, _, _, _, _ = self.forward(out[:, :generated], local_iters=local_iters)
+            logits, _, _, _, _, _ = self.forward(out[:, :generated], local_iters=local_iters)
             next_token_logits = logits[:, -1, :] / max(1e-6, temperature)
 
             # Top-K Sampling

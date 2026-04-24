@@ -50,20 +50,22 @@ def train_ppc_sharded(model, dataloader, lr=1e-4, epochs=1, local_iterations=2):
             
             # Forward with Modern AMP
             with torch.amp.autocast('cuda'):
-                # V3 Model returns: logits, avg_iters, avg_energy, layer_energies, aux_loss
+                # V3 Model returns: logits, avg_iters, avg_energy, layer_energies, aux_loss, sg_penalty
                 out = model(x, local_iters=local_iterations)
-                if isinstance(out, tuple) and len(out) == 5:
-                    logits, avg_iters, avg_energy, _, aux_loss = out
-                elif isinstance(out, tuple):
-                    logits, avg_iters, avg_energy, _ = out
-                    aux_loss = torch.tensor(0.0, device=logits.device)
+                if isinstance(out, tuple) and len(out) >= 5:
+                    logits = out[0]
+                    avg_iters = out[1]
+                    avg_energy = out[2]
+                    aux_loss = out[4] if len(out) > 4 else torch.tensor(0.0, device=out[0].device)
+                    sg_penalty = out[5] if len(out) > 5 else torch.tensor(0.0, device=out[0].device)
                 else:
                     logits = out
                     avg_iters, avg_energy = 0, 0.0
                     aux_loss = torch.tensor(0.0, device=logits.device)
+                    sg_penalty = torch.tensor(0.0, device=logits.device)
 
                 B, T, V = logits.shape
-                loss = F.cross_entropy(logits.reshape(B * T, V), y.reshape(B * T)) + 0.01 * aux_loss
+                loss = F.cross_entropy(logits.reshape(B * T, V), y.reshape(B * T)) + 0.01 * aux_loss + sg_penalty
             
             # Scaled Backward & Optim
             scaler.scale(loss).backward()
