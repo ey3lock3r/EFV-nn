@@ -30,8 +30,12 @@ def _phase_rotation_kernel(
     cos_p  = tl.load(cos_p_ptr + d_off, mask=mask, other=0.0)
     sin_p  = tl.load(sin_p_ptr + d_off, mask=mask, other=0.0)
 
-    rot_r = prev_r * cos_p - prev_i * sin_p
-    rot_i = prev_r * sin_p + prev_i * cos_p
+    prev_r_f32 = prev_r.to(tl.float32)
+    prev_i_f32 = prev_i.to(tl.float32)
+    cos_p_f32  = cos_p.to(tl.float32)
+    sin_p_f32  = sin_p.to(tl.float32)
+    rot_r = prev_r_f32 * cos_p_f32 - prev_i_f32 * sin_p_f32
+    rot_i = prev_r_f32 * sin_p_f32 + prev_i_f32 * cos_p_f32
 
     cond = tl.broadcast_to(has_prev, (BLOCK_D,))
     out_r = tl.where(cond, rot_r, cur_r)
@@ -104,8 +108,12 @@ def _ocns_delay_kernel(
             gi = tl.load(delay_gains_ptr + gain_base + d_off * 2 + 1, mask=mask, other=0.0)
 
             v_mask = tl.broadcast_to(valid, (BLOCK_D,))
-            acc_r += tl.where(v_mask, dr * gr - di * gi, 0.0)
-            acc_i += tl.where(v_mask, dr * gi + di * gr, 0.0)
+            dr_f32 = dr.to(tl.float32)
+            di_f32 = di.to(tl.float32)
+            gr_f32 = gr.to(tl.float32)
+            gi_f32 = gi.to(tl.float32)
+            acc_r += tl.where(v_mask, dr_f32 * gr_f32 - di_f32 * gi_f32, 0.0)
+            acc_i += tl.where(v_mask, dr_f32 * gi_f32 + di_f32 * gr_f32, 0.0)
 
     tl.store(x_eff_ptr + row + d_off * 2,     acc_r, mask=mask)
     tl.store(x_eff_ptr + row + d_off * 2 + 1, acc_i, mask=mask)
@@ -246,11 +254,11 @@ def _anderson_mixing_kernel(
     
     f_x_base = b * N + n_off
     f_x = tl.load(f_x_ptr + f_x_base, mask=mask, other=0.0)
-    acc = f_x
+    acc = f_x.to(tl.float32)
     for i in range(m_k):
-        a = tl.load(alpha_ptr + b * m_k + i)
-        hist_val = tl.load(F_hist_ptr + b * m_total * N + i * N + n_off, mask=mask, other=0.0)
-        acc -= a * (f_x - hist_val)
+        a = tl.load(alpha_ptr + b * m_k + i).to(tl.float32)
+        hist_val = tl.load(F_hist_ptr + b * m_total * N + i * N + n_off, mask=mask, other=0.0).to(tl.float32)
+        acc -= a * (f_x.to(tl.float32) - hist_val)
     tl.store(out_ptr + f_x_base, acc, mask=mask)
 
 
@@ -309,8 +317,12 @@ def _moe_dispatch_delay_kernel(
             gr = tl.load(delay_gains_ptr + gain_base + d_off * 2,     mask=mask, other=0.0)
             gi = tl.load(delay_gains_ptr + gain_base + d_off * 2 + 1, mask=mask, other=0.0)
             v_mask = tl.broadcast_to(valid, (BLOCK_D,))
-            acc_r += tl.where(v_mask, dr * gr - di * gi, 0.0)
-            acc_i += tl.where(v_mask, dr * gi + di * gr, 0.0)
+            dr_f32 = dr.to(tl.float32)
+            di_f32 = di.to(tl.float32)
+            gr_f32 = gr.to(tl.float32)
+            gi_f32 = gi.to(tl.float32)
+            acc_r += tl.where(v_mask, dr_f32 * gr_f32 - di_f32 * gi_f32, 0.0)
+            acc_i += tl.where(v_mask, dr_f32 * gi_f32 + di_f32 * gr_f32, 0.0)
     out_row = pid * D * 2
     tl.store(out_ptr + out_row + d_off * 2,     acc_r, mask=mask)
     tl.store(out_ptr + out_row + d_off * 2 + 1, acc_i, mask=mask)
