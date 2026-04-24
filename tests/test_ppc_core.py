@@ -572,3 +572,29 @@ class TestOptimizerRestore:
         for p in model2.parameters():
             assert p in opt.state, "Parameter not found in optimizer state after restore"
             assert 'exp_avg' in opt.state[p], "Adam exp_avg missing after restore"
+
+
+class TestCheckpointPrefixStrip:
+    def test_strip_compiled_prefix(self):
+        """_orig_mod. prefix must be stripped from all keys."""
+        from efv_nn.ppc_sharded import strip_compiled_prefix
+        raw = {
+            '_orig_mod.embedding.weight': torch.ones(2),
+            '_orig_mod.layers.0.moe.gate_weights': torch.ones(3),
+            'layer_norm.weight': torch.ones(4),
+            '_adjoint_cache': torch.zeros(1),
+        }
+        clean = strip_compiled_prefix(raw)
+        assert 'embedding.weight' in clean
+        assert 'layers.0.moe.gate_weights' in clean
+        assert 'layer_norm.weight' in clean
+        assert '_adjoint_cache' not in clean, "adjoint_cache must be filtered out"
+        assert '_orig_mod.embedding.weight' not in clean
+
+    def test_no_double_strip(self):
+        """Keys without the prefix must pass through unchanged."""
+        from efv_nn.ppc_sharded import strip_compiled_prefix
+        raw = {'embedding.weight': torch.ones(2)}
+        clean = strip_compiled_prefix(raw)
+        assert 'embedding.weight' in clean
+        assert len(clean) == 1

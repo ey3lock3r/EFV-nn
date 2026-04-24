@@ -11,6 +11,25 @@ try:
 except ImportError:
     _BNB_AVAILABLE = False
 
+def strip_compiled_prefix(state_dict: dict) -> dict:
+    """
+    Strips '_orig_mod.' prefix added by torch.compile and removes buffers that
+    should never be restored from checkpoints (_adjoint_cache).
+
+    Usage:
+        state = strip_compiled_prefix(torch.load(path)['model'])
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        assert not missing, f"Missing keys after load: {missing}"
+    """
+    out = {}
+    for k, v in state_dict.items():
+        if k.startswith('_adjoint_cache'):
+            continue
+        clean_key = k.replace('_orig_mod.', '')
+        out[clean_key] = v
+    return out
+
+
 class ShardedPPCGraphLLM(nn.Module):
     def __init__(self, vocab_size: int, hidden_dim: int = 1024, num_layers: int = 24,
                  num_experts: int = 64, local_lr: float = 0.05, lr_decay: float = 0.85,
