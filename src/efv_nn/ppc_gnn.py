@@ -173,7 +173,7 @@ class PPCNodeLayer(nn.Module):
                     x_batched = triton_kernels.fused_moe_dispatch_delay(
                         x, self.delay_gains, self.prime_delays, topk_indices
                     )
-                    pred, _, _, _ = self.moe.compute(x_batched, topk_indices, topk_scores, B * T)
+                    pred, _, _, _, _aux = self.moe.compute(x_batched, topk_indices, topk_scores, B * T)
                     pred = pred.reshape(B, T, D, 2)
                 else:
                     # Pillar 5: Dynamic Routing + Dispatch (PyTorch Path - Reconnects Autograd)
@@ -182,7 +182,7 @@ class PPCNodeLayer(nn.Module):
                     else:
                         x_eff = x
                     B_in, T_in, D_in, _ = x_eff.shape
-                    pred, _, _, _ = self.moe(x_eff.reshape(B_in * T_in, D_in, 2), gate_bias=g_bias)
+                    pred, _, _, _, _aux = self.moe(x_eff.reshape(B_in * T_in, D_in, 2), gate_bias=g_bias)
                     pred = pred.float().reshape(B_in, T_in, D_in, 2)
                 
                 # Pillar 6: Contractive Residual. 
@@ -222,10 +222,21 @@ class PPCNodeLayer(nn.Module):
                 x_stream, f_solver, f_forward_step, gate_bias, x_target, self.moe.cache_weights, self.moe.clear_cache, self._adjoint_cache, [self.moe], *layer_params
             )
 
+            # Compute aux_loss via a single forward evaluation outside the DEQ loop
+            # (gradient-enabled; gives MoE routing its load-balance signal)
+            if torch.is_grad_enabled():
+                x_for_aux = out.detach()
+                if self.prime_delays:
+                    x_for_aux = self._apply_ocns_delays(x_for_aux)
+                B_a, T_a, D_a, _ = x_for_aux.shape
+                _, _, _, _, aux_loss = self.moe(x_for_aux.reshape(B_a * T_a, D_a, 2), gate_bias=gate_bias)
+            else:
+                aux_loss = torch.tensor(0.0, device=out.device)
+
         if unbatched:
             out = out.squeeze(0)
-            
-        return out.to(original_dtype), iters_run, res_norm
+
+        return out.to(original_dtype), iters_run, res_norm, aux_loss
 
 
 class PPCGraphLLM(nn.Module):
@@ -264,11 +275,13 @@ class PPCGraphLLM(nn.Module):
         x = self.embed(input_ids)            # [B, T, D, 2]
 
         total_iters = 0
+        total_aux_loss = torch.tensor(0.0, device=x.device)
         layer_energies = torch.empty(len(self.layers), device=x.device, dtype=torch.float32)
         for i, layer in enumerate(self.layers):
-            x, iters, res_norm = layer(x, local_iters, rolling_energy=rolling_energy)
+            x, iters, res_norm, aux_loss = layer(x, local_iters, rolling_energy=rolling_energy)
             total_iters += iters
             layer_energies[i] = res_norm
+            total_aux_loss = total_aux_loss + aux_loss
 
         avg_energy = layer_energies.mean()
 
@@ -276,4 +289,4 @@ class PPCGraphLLM(nn.Module):
         x_flat = x.flatten(-2)
         x_norm = self.layer_norm(x_flat)
         logits = self.output_head(x_norm)
-        return logits, total_iters / len(self.layers), avg_energy, layer_energies
+        return logits, total_iters / len(self.layers), avg_energy, layer_energies, total_aux_loss

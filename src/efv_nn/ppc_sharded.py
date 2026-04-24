@@ -68,6 +68,7 @@ class ShardedPPCGraphLLM(nn.Module):
         x = self.embed(input_ids) # [B, T, D, 2]
 
         total_iters = 0
+        total_aux_loss = torch.tensor(0.0, device=self.d1)
         # Pre-allocate energy tensor on d1 to avoid per-layer to() calls and list + stack
         layer_energies = torch.empty(self.num_layers, device=self.d1, dtype=torch.float32)
         for i, layer in enumerate(self.layers):
@@ -77,12 +78,13 @@ class ShardedPPCGraphLLM(nn.Module):
             if x.device != target_device:
                 x = x.to(target_device)
 
-            x, iters, res_norm = layer(x, local_iters, rolling_energy=rolling_energy)
+            x, iters, res_norm, aux_loss = layer(x, local_iters, rolling_energy=rolling_energy)
 
             # Isolation: Prevent CUDA Graph buffer overwrite in loops
             x = x.clone()
             total_iters += iters.item()
             layer_energies[i] = res_norm.to(self.d1)
+            total_aux_loss = total_aux_loss + aux_loss.to(self.d1)
 
         avg_energy = layer_energies.mean()
 
@@ -92,7 +94,7 @@ class ShardedPPCGraphLLM(nn.Module):
         x_flat = x.flatten(-2) # [..., 2D]
         x_norm = self.layer_norm(x_flat)
         logits = self.output_head(x_norm)
-        return logits, total_iters / self.num_layers, avg_energy, layer_energies
+        return logits, total_iters / self.num_layers, avg_energy, layer_energies, total_aux_loss
 
     @torch.no_grad()
     def swarm_forward(self, input_ids: torch.Tensor, swarm_size: int = 8, local_iters: int = 16):
@@ -180,7 +182,7 @@ class ShardedPPCGraphLLM(nn.Module):
         generated = T0
 
         for step in range(max_new_tokens):
-            logits, _, _, _ = self.forward(out[:, :generated], local_iters=local_iters)
+            logits, _, _, _, _ = self.forward(out[:, :generated], local_iters=local_iters)
             next_token_logits = logits[:, -1, :] / max(1e-6, temperature)
 
             # Top-K Sampling

@@ -218,7 +218,7 @@ class TestExpertChoiceMoEMatcher:
         moe = self._make_matcher(hidden_dim=hidden_dim, num_experts=4, k=4)
         x = torch.randn(seq_len, hidden_dim, 2)
         # Act
-        out, _, _, _ = moe(x)
+        out, _, _, _, _ = moe(x)
         # Assert
         assert out.shape == x.shape, f"Expected {x.shape}, got {out.shape}"
 
@@ -250,7 +250,7 @@ class TestPPCNodeLayer:
         layer = PPCNodeLayer(hidden_dim=hidden_dim)
         x = torch.randn(seq_len, hidden_dim, 2)
         # Act
-        out, _, _ = layer(x, local_iters=2)
+        out, _, _, _ = layer(x, local_iters=2)
         # Assert
         assert out.shape == x.shape
 
@@ -261,7 +261,7 @@ class TestPPCNodeLayer:
         layer = PPCNodeLayer(hidden_dim=16)
         x = torch.randn(8, 16, 2)
         # Act
-        out, _, _ = layer(x, local_iters=3)
+        out, _, _, _ = layer(x, local_iters=3)
         # Assert
         assert not torch.isnan(out).any(), "NaN in output"
 
@@ -273,9 +273,9 @@ class TestPPCNodeLayer:
         max_iters = 20
 
         # low rolling_energy → dynamic_tol is relaxed → exits earlier
-        _, iters_relaxed, _ = layer(x, local_iters=max_iters, rolling_energy=0.0)
+        _, iters_relaxed, _, _ = layer(x, local_iters=max_iters, rolling_energy=0.0)
         # high rolling_energy → dynamic_tol is tight → uses more iterations
-        _, iters_tight, _ = layer(x, local_iters=max_iters, rolling_energy=100.0)
+        _, iters_tight, _, _ = layer(x, local_iters=max_iters, rolling_energy=100.0)
 
         assert iters_relaxed <= iters_tight, (
             f"APD: low energy should exit no later than high energy: "
@@ -306,7 +306,7 @@ class TestPPCNodeLayer:
 
         # Act
         with torch.no_grad():
-            layer(x, local_iters=2, gate_bias=sentinel_bias)
+            layer(x, local_iters=2, gate_bias=sentinel_bias)  # return is 4-tuple; not unpacked here
 
         # Assert
         assert captured.get('gate_bias') is not None, "gate_bias was None — external bias dropped"
@@ -330,7 +330,7 @@ class TestPPCGraphLLM:
         model = self._make_model(vocab_size=vocab_size)
         input_ids = torch.arange(seq_len) % vocab_size
         # Act
-        logits, _, _, _ = model(input_ids, local_iters=2)
+        logits, _, _, _, _ = model(input_ids, local_iters=2)
         # Assert
         assert logits.shape == (seq_len, vocab_size), \
             f"Expected ({seq_len}, {vocab_size}), got {logits.shape}"
@@ -342,7 +342,7 @@ class TestPPCGraphLLM:
         model = self._make_model(vocab_size=vocab_size)
         input_ids = torch.randint(0, vocab_size, (B, seq_len))
         # Act
-        logits, avg_iters, avg_energy, layer_energies = model(input_ids, local_iters=2)
+        logits, avg_iters, avg_energy, layer_energies, aux_loss = model(input_ids, local_iters=2)
         # Assert
         assert logits.shape == (B, seq_len, vocab_size), \
             f"Expected ({B}, {seq_len}, {vocab_size}), got {logits.shape}"
@@ -355,7 +355,7 @@ class TestPPCGraphLLM:
         model = self._make_model()
         input_ids = torch.randint(0, 10, (12,))
         # Act
-        logits, _, _, _ = model(input_ids)
+        logits, _, _, _, _ = model(input_ids)
         # Assert
         assert not torch.isnan(logits).any(), "NaN detected in model logits"
 
@@ -372,7 +372,7 @@ class TestPPCGraphLLM:
         criterion = nn.CrossEntropyLoss()
 
         def compute_loss():
-            logits, _, _, _ = model(input_ids)
+            logits, _, _, _, _ = model(input_ids)
             return criterion(logits[:-1], target_ids[:-1])
 
         # Act
@@ -399,7 +399,7 @@ class TestPPCGraphLLM:
 
         # Act
         with torch.no_grad():
-            model(input_ids, local_iters=3)
+            model(input_ids, local_iters=3)  # return is 5-tuple; not unpacked here
 
         # Assert — cache must be cleaned up by cleanup_fn
         for layer in model.layers:
@@ -414,7 +414,7 @@ class TestPPCGraphLLM:
         target = torch.randint(0, 10, (1, 8))
 
         # Act
-        logits, _, _, _ = model(input_ids, local_iters=3)
+        logits, _, _, _, _ = model(input_ids, local_iters=3)
         loss = nn.CrossEntropyLoss()(logits.reshape(-1, 10), target.reshape(-1))
         loss.backward()
 
@@ -447,7 +447,7 @@ class TestShardedPPCGraphLLM:
         input_ids = torch.randint(0, vocab_size, (B, T))
 
         # Act
-        logits, avg_iters, avg_energy, layer_energies = model(input_ids, local_iters=2)
+        logits, avg_iters, avg_energy, layer_energies, aux_loss = model(input_ids, local_iters=2)
 
         # Assert
         assert logits.shape == (B, T, vocab_size)
@@ -481,3 +481,39 @@ class TestShardedPPCGraphLLM:
         with torch.no_grad():
             out = model.generate(input_ids, max_new_tokens=3, local_iters=2)
         assert out.shape[0] == 3
+
+
+class TestMoELoadBalance:
+    def test_aux_loss_is_scalar_tensor(self):
+        """compute() must return a scalar aux_loss when grad is enabled."""
+        moe = ExpertChoiceMoEMatcher(hidden_dim=16, num_experts=4, k_nodes=4)
+        x = torch.randn(8, 16, 2, requires_grad=True)
+        topk_indices, topk_scores = moe.get_indices(x)
+        flat = topk_indices.reshape(-1)
+        x_batched = x[flat].view(4, topk_indices.shape[1], 16, 2)
+        out, _, _, _, aux_loss = moe.compute(x_batched, topk_indices, topk_scores, 8)
+        assert isinstance(aux_loss, torch.Tensor)
+        assert aux_loss.ndim == 0
+        assert aux_loss.item() >= 0.0
+
+    def test_aux_loss_zero_in_no_grad(self):
+        """aux_loss must be 0 during inference (no_grad)."""
+        moe = ExpertChoiceMoEMatcher(hidden_dim=16, num_experts=4, k_nodes=4)
+        x = torch.randn(8, 16, 2)
+        topk_indices, topk_scores = moe.get_indices(x)
+        flat = topk_indices.reshape(-1)
+        x_batched = x[flat].view(4, topk_indices.shape[1], 16, 2)
+        with torch.no_grad():
+            out, _, _, _, aux_loss = moe.compute(x_batched, topk_indices, topk_scores, 8)
+        assert aux_loss.item() == 0.0
+
+    def test_ppcgraphllm_returns_aux_loss(self):
+        """PPCGraphLLM.forward must return 5-tuple including scalar aux_loss."""
+        from efv_nn.ppc_gnn import PPCGraphLLM
+        model = PPCGraphLLM(vocab_size=10, hidden_dim=32, num_layers=2)
+        ids = torch.randint(0, 10, (2, 8))
+        out = model(ids, local_iters=2)
+        assert len(out) == 5, f"Expected 5-tuple, got {len(out)}"
+        logits, avg_iters, avg_energy, layer_energies, aux_loss = out
+        assert aux_loss.ndim == 0
+        assert aux_loss.item() >= 0.0

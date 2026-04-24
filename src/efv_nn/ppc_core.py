@@ -179,8 +179,9 @@ class ExpertChoiceMoEMatcher(nn.Module):
             yr = torch.matmul(xr, wr) - torch.matmul(xi, wi)
             yi = torch.matmul(xr, wi) + torch.matmul(xi, wr)
         else:
-            xr_h = x_batched[..., 0].half()
-            xi_h = x_batched[..., 1].half()
+            w_dtype = self.experts_weight_real.dtype
+            xr_h = x_batched[..., 0].to(w_dtype)
+            xi_h = x_batched[..., 1].to(w_dtype)
             wr_h = self.experts_weight_real[..., 0].contiguous()
             wi_h = self.experts_weight_real[..., 1].contiguous()
             yr = torch.matmul(xr_h, wr_h).float() - torch.matmul(xi_h, wi_h).float()
@@ -229,17 +230,24 @@ class ExpertChoiceMoEMatcher(nn.Module):
                 counts_buf = self._counts_buf.detach()
             res = self.activation(agg)
 
-        return res.to(original_dtype), topk_indices, topk_scores, counts_buf
+        # Load-balance auxiliary loss: penalise unequal expert utilisation.
+        # Only computed during training to avoid graph overhead during inference.
+        if torch.is_grad_enabled():
+            full_counts = torch.zeros(B_T, device=res.device, dtype=torch.float32)
+            full_counts.index_add_(0, flat_indices, torch.ones(flat_indices.shape[0], device=res.device, dtype=torch.float32))
+            aux_loss = self.num_experts * full_counts.var() / (full_counts.mean().clamp(min=1e-6))
+        else:
+            aux_loss = torch.tensor(0.0, device=res.device)
+
+        return res.to(original_dtype), topk_indices, topk_scores, counts_buf, aux_loss
 
     def forward(self, x, gate_bias=None):
         B_T = x.shape[0]
         topk_indices, topk_scores = self.get_indices(x, gate_bias)
-
-        # Standard Dispatch (if not using fused external dispatch)
         flat_indices = topk_indices.reshape(-1)
         x_batched = x[flat_indices].view(self.num_experts, topk_indices.shape[1], x.shape[1], 2)
-
-        return self.compute(x_batched, topk_indices, topk_scores, B_T)
+        res, idx, scores, counts, aux_loss = self.compute(x_batched, topk_indices, topk_scores, B_T)
+        return res, idx, scores, counts, aux_loss
 
     def transpose_forward(self, residual, topk_indices, topk_scores, counts):
         original_dtype = residual.dtype
