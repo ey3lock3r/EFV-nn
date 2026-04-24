@@ -59,7 +59,9 @@ def anderson_acceleration(f: Callable, x0: torch.Tensor, m: int = 5, lam: float 
 
         res_k = f_x_flat - x_flat
         res_norm = torch.norm(res_k, dim=-1).mean()
-        if res_norm < tol:
+        x_norm_val = torch.norm(x_flat, dim=-1).mean().clamp(min=1e-8)
+        rel_res = res_norm / x_norm_val
+        if res_norm < tol or rel_res < tol * 10:
             break
 
         m_k = min(k, m)
@@ -157,9 +159,12 @@ class DEQFunction(torch.autograd.Function):
                 return grad_output + vjp
 
             # --- ADJOINT WARM-STARTING ---
-            # If cache exists and matches shape, use it as starting guess.
-            # This reduces backward iters from ~8 to 3-4.
-            g0 = adjoint_cache if adjoint_cache.shape == grad_output.shape else grad_output
+            # Blend 90% cache + 10% grad_output to maintain directional diversity.
+            # Guard: only use cache if shape matches AND it's non-zero (not first backward pass).
+            if adjoint_cache.shape == grad_output.shape and adjoint_cache.norm() > 0:
+                g0 = 0.9 * adjoint_cache.detach() + 0.1 * grad_output
+            else:
+                g0 = grad_output
 
             # --- ADJOINT EARLY-EXIT (Dynamic Tolerance) ---
             # We relax the tolerance if the initial residual is high, allowing faster convergence
