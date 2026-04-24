@@ -30,7 +30,7 @@ def validate_v3():
     input_ids = torch.randint(0, vocab_size, (1, seq_len)).to(device)
     
     # We run in float32 for stability as per Pillar 4
-    logits, avg_iters, avg_energy, energies = model(input_ids, local_iters=10)
+    logits, avg_iters, avg_energy, energies, aux_loss = model(input_ids, local_iters=10)
     
     assert logits.shape == (1, seq_len, vocab_size)
     assert avg_iters > 0
@@ -44,7 +44,7 @@ def validate_v3():
     
     for i in range(3):
         optimizer.zero_grad()
-        logits, _, _, _ = model(input_ids, local_iters=5)
+        logits, _, _, _, _ = model(input_ids, local_iters=5)
         loss = criterion(logits.view(-1, vocab_size), target_ids.view(-1))
         print(f"  Iteration {i}, Loss: {loss.item():.4f}")
         loss.backward()
