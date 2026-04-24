@@ -213,7 +213,7 @@ class PPCNodeLayer(nn.Module):
                 return anderson_acceleration(
                     lambda x: f_forward_step(x, x_init, g_bias, target),
                     x_init,
-                    m=5, max_iter=local_iters, tol=dynamic_tol
+                    m=5, max_iter=local_iters, tol=dynamic_tol, min_iters=self.min_iters
                 )
 
             # Ensure Adjoint Cache matches the current stream shape for warm-starting.

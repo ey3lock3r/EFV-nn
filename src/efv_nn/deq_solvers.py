@@ -9,7 +9,7 @@ try:
 except ImportError:
     _TRITON_AVAILABLE = False
 
-def anderson_acceleration(f: Callable, x0: torch.Tensor, m: int = 5, lam: float = 1e-4, max_iter: int = 50, tol: float = 1e-5) -> Tuple[torch.Tensor, int, torch.Tensor]:
+def anderson_acceleration(f: Callable, x0: torch.Tensor, m: int = 5, lam: float = 1e-4, max_iter: int = 50, tol: float = 1e-5, min_iters: int = 1) -> Tuple[torch.Tensor, int, torch.Tensor]:
     """
     Anderson Acceleration for Fixed Point Iteration.
     Solves x = f(x).
@@ -61,7 +61,7 @@ def anderson_acceleration(f: Callable, x0: torch.Tensor, m: int = 5, lam: float 
         res_norm = torch.norm(res_k, dim=-1).mean()
         x_norm_val = torch.norm(x_flat, dim=-1).mean().clamp(min=1e-8)
         rel_res = res_norm / x_norm_val
-        if res_norm < tol or rel_res < tol * 10:
+        if (res_norm < tol or rel_res < tol * 10) and iters_run >= min_iters:
             break
 
         m_k = min(k, m)
