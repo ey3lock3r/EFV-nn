@@ -545,3 +545,30 @@ class TestSpectralGuardian:
         *_, aux_loss, sg_penalty = out
         assert sg_penalty.ndim == 0
         assert sg_penalty.item() >= 0.0
+
+
+class TestOptimizerRestore:
+    def test_restore_maps_momentum_by_name(self):
+        """After model reload, optimizer state must be correctly mapped by param name."""
+        import torch.optim as optim
+        from efv_nn.training import restore_optimizer_state
+
+        model1 = torch.nn.Linear(8, 4)
+        opt = optim.Adam(model1.parameters(), lr=1e-3)
+        # Simulate one step to populate optimizer state
+        loss = model1(torch.randn(2, 8)).sum()
+        loss.backward()
+        opt.step()
+        assert any(len(s) > 0 for s in opt.state.values()), "Adam state is empty after step"
+
+        # Simulate reload: new model with same structure
+        model2 = torch.nn.Linear(8, 4)
+        model2.load_state_dict(model1.state_dict())
+
+        # Restore state by name
+        restore_optimizer_state(opt, model1, model2)
+
+        # All params in model2 must have optimizer state mapped
+        for p in model2.parameters():
+            assert p in opt.state, "Parameter not found in optimizer state after restore"
+            assert 'exp_avg' in opt.state[p], "Adam exp_avg missing after restore"

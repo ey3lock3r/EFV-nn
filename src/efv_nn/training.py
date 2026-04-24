@@ -6,6 +6,26 @@ import wandb
 from tqdm import tqdm
 import time
 
+def restore_optimizer_state(optimizer, old_model, new_model):
+    """
+    Re-keys optimizer state from old model parameter objects to new model parameter objects,
+    matched by parameter name. Moves tensors to the correct device.
+
+    Call this after: new_model.load_state_dict(checkpoint['model']).
+    """
+    old_state_by_name = {
+        name: optimizer.state[param]
+        for name, param in old_model.named_parameters()
+        if param in optimizer.state
+    }
+    for name, new_param in new_model.named_parameters():
+        if name in old_state_by_name:
+            state = old_state_by_name[name]
+            optimizer.state[new_param] = {
+                k: v.to(new_param.device) if isinstance(v, torch.Tensor) else v
+                for k, v in state.items()
+            }
+
 def train_ppc_sharded(model, dataloader, lr=1e-4, epochs=1, local_iterations=2):
     """
     Sharded Training Loop with GradScaler (AMP) for Dual T4 GPUs.
