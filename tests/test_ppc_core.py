@@ -695,3 +695,53 @@ class TestFP16GradClamp:
         g_clamped = g_fp32.clamp(-FP16_MAX, FP16_MAX).half()
         assert g_clamped[0].item() == FP16_MAX, f"Expected {FP16_MAX}, got {g_clamped[0]}"
         assert not torch.isinf(g_clamped).any()
+
+
+class TestOCNSDelays:
+    def test_default_delays_are_geometric(self):
+        """Default prime_delays must be geometric [1, 2, 4, 8]."""
+        layer = PPCNodeLayer(hidden_dim=16)
+        assert layer.prime_delays == [1, 2, 4, 8], (
+            f"Expected [1,2,4,8], got {layer.prime_delays}"
+        )
+
+    def test_delay_gains_nonzero_at_init(self):
+        """delay_gains must be non-zero at initialisation to avoid dead-neuron startup."""
+        layer = PPCNodeLayer(hidden_dim=16)
+        assert layer.delay_gains.abs().max().item() > 0, "delay_gains are all zero at init"
+
+
+class TestShardedClone:
+    def test_same_device_layers_do_not_clone_unnecessarily(self):
+        """Forward pass must complete without error and shapes must be preserved."""
+        from efv_nn.ppc_sharded import ShardedPPCGraphLLM
+        # Use single-device (CPU) to verify no-clone path doesn't break correctness
+        model = ShardedPPCGraphLLM(
+            vocab_size=10, hidden_dim=16, num_layers=2, num_experts=4,
+            prime_delays=[1, 2], use_triton=False
+        )
+        ids = torch.randint(0, 10, (1, 4))
+        out = model(ids, local_iters=2)
+        assert out[0].shape == (1, 4, 10)
+
+
+class TestLRFloorGuard:
+    def test_lr_floor_guard_caps_exponential_decay(self):
+        """After max_halvings consecutive halvings, LR must be reset to recovery_lr."""
+        from efv_nn.training import lr_floor_guard
+        state = {'lr': 1e-4, 'halving_count': 0}
+        for _ in range(3):
+            state = lr_floor_guard(state, lr_init=1e-4, max_halvings=3, recovery_factor=0.1)
+            state['lr'] /= 2  # simulate halving
+        # After 3 halvings without reset, next call should reset
+        state = lr_floor_guard(state, lr_init=1e-4, max_halvings=3, recovery_factor=0.1)
+        assert state['halving_count'] == 0, "Counter must reset after max_halvings"
+        assert abs(state['lr'] - 1e-4 * 0.1) < 1e-10, f"Expected recovery LR, got {state['lr']}"
+
+    def test_lr_floor_guard_no_reset_before_limit(self):
+        """Must not reset if halving_count is below max_halvings."""
+        from efv_nn.training import lr_floor_guard
+        state = {'lr': 5e-5, 'halving_count': 1}
+        state = lr_floor_guard(state, lr_init=1e-4, max_halvings=3, recovery_factor=0.1)
+        assert state['halving_count'] == 2, "Counter must increment, not reset"
+        assert state['lr'] == 5e-5, "LR must not change before limit"

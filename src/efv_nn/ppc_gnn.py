@@ -41,7 +41,7 @@ def phasal_energy(z: torch.Tensor) -> torch.Tensor:
 class PPCNodeLayer(nn.Module):
     def __init__(self, hidden_dim: int, num_experts: int = 64, local_lr: float = 0.05,
                  lr_decay: float = 0.8, use_jacobian: bool = False,
-                 prime_delays=(1, 2, 3, 5), use_triton: bool = True,
+                 prime_delays=(1, 2, 4, 8), use_triton: bool = True,
                  device=None, dtype=torch.float32, tolerance=1e-3, min_iters=8):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -59,7 +59,9 @@ class PPCNodeLayer(nn.Module):
         self.prime_delays = list(prime_delays) if prime_delays else []
         if self.prime_delays:
             # Shape: [num_delays, hidden_dim, 2] - allows complex scaling and phase rotation
-            self.delay_gains = nn.Parameter(torch.zeros(len(self.prime_delays), hidden_dim, 2, device=device, dtype=dtype))
+            self.delay_gains = nn.Parameter(
+                torch.randn(len(self.prime_delays), hidden_dim, 2, device=device, dtype=dtype) * 0.01
+            )
 
         # Phase rotation parameters: store as cos/sin for manual rotation
         phase = torch.rand(hidden_dim, device=device) * 2 * math.pi

@@ -33,7 +33,7 @@ def strip_compiled_prefix(state_dict: dict) -> dict:
 class ShardedPPCGraphLLM(nn.Module):
     def __init__(self, vocab_size: int, hidden_dim: int = 1024, num_layers: int = 24,
                  num_experts: int = 64, local_lr: float = 0.05, lr_decay: float = 0.85,
-                 use_jacobian: bool = False, prime_delays=(1, 2, 3, 5), use_triton: bool = True):
+                 use_jacobian: bool = False, prime_delays=(1, 2, 4, 8), use_triton: bool = True):
         super().__init__()
         self.vocab_size = vocab_size
         self.hidden_dim = hidden_dim
@@ -95,13 +95,15 @@ class ShardedPPCGraphLLM(nn.Module):
             target_device = self.layer_target_devices[i]
 
             # Optimized Zero-G Guard: Comparison of device objects is much faster than strings
-            if x.device != target_device:
+            crossed_device = x.device != target_device
+            if crossed_device:
                 x = x.to(target_device)
 
             x, iters, res_norm, aux_loss = layer(x, local_iters, rolling_energy=current_energy)
 
-            # Isolation: Prevent CUDA Graph buffer overwrite in loops
-            x = x.clone()
+            # Clone only after a cross-device move to prevent buffer aliasing
+            if crossed_device:
+                x = x.clone()
             total_iters += iters.item()
             e = ppc_gnn.phasal_energy(x).item()
             layer_energies[i] = e

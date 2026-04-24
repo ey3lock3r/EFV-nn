@@ -26,6 +26,30 @@ def restore_optimizer_state(optimizer, old_model, new_model):
                 for k, v in state.items()
             }
 
+def lr_floor_guard(state: dict, lr_init: float, max_halvings: int = 3, recovery_factor: float = 0.1) -> dict:
+    """
+    Prevents the FSM DIVERGING state from exponentially decaying LR into stall.
+
+    Call this each time the FSM would halve the LR. If halving_count reaches
+    max_halvings, resets LR to lr_init * recovery_factor and resets the counter.
+
+    Args:
+        state: dict with keys 'lr' and 'halving_count'.
+        lr_init: The original starting LR for the current phase.
+        max_halvings: Max consecutive halvings before recovery.
+        recovery_factor: Recovery LR = lr_init * recovery_factor.
+
+    Returns:
+        Updated state dict.
+    """
+    state = dict(state)  # don't mutate caller's dict
+    state['halving_count'] = state.get('halving_count', 0) + 1
+    if state['halving_count'] > max_halvings:
+        state['lr'] = lr_init * recovery_factor
+        state['halving_count'] = 0
+    return state
+
+
 def train_ppc_sharded(model, dataloader, lr=1e-4, epochs=1, local_iterations=2):
     """
     Sharded Training Loop with GradScaler (AMP) for Dual T4 GPUs.
@@ -61,58 +85,63 @@ def train_ppc_sharded(model, dataloader, lr=1e-4, epochs=1, local_iterations=2):
         for batch in pbar:
             step += 1
             start_time = time.time()
-            
+
             # Input/Target management
             x = batch[:, :-1]
             y = batch[:, 1:].to(device1)
-            
+
             optimizer.zero_grad()
-            
+
+            t_start_compute = time.time()
             # Forward with Modern AMP
             with torch.amp.autocast('cuda'):
                 # V3 Model returns: logits, avg_iters, avg_energy, layer_energies, aux_loss, sg_penalty
-                out = model(x, local_iters=local_iterations)
-                if isinstance(out, tuple) and len(out) >= 5:
-                    logits = out[0]
-                    avg_iters = out[1]
-                    avg_energy = out[2]
-                    aux_loss = out[4] if len(out) > 4 else torch.tensor(0.0, device=out[0].device)
-                    sg_penalty = out[5] if len(out) > 5 else torch.tensor(0.0, device=out[0].device)
-                else:
-                    logits = out
-                    avg_iters, avg_energy = 0, 0.0
-                    aux_loss = torch.tensor(0.0, device=logits.device)
-                    sg_penalty = torch.tensor(0.0, device=logits.device)
+                logits, avg_iters, avg_energy, _, aux_loss, sg_penalty = model(x, local_iters=local_iterations)
 
                 B, T, V = logits.shape
-                loss = F.cross_entropy(logits.reshape(B * T, V), y.reshape(B * T)) + 0.01 * aux_loss + sg_penalty
-            
+                task_loss = F.cross_entropy(logits.reshape(B * T, V), y.reshape(B * T))
+                loss = task_loss + 0.01 * aux_loss + sg_penalty
+            t_compute = time.time() - t_start_compute
+
             # Scaled Backward & Optim
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            
+
             scaler.step(optimizer)
             scaler.update()
-            
+
             if step % 50 == 0:
                 torch.cuda.empty_cache()
-            
+
             # Logging — batch all .item() / CPU syncs here, never in the hot path above
             if step % 10 == 0:
                 loss_val   = loss.item()   # single GPU→CPU sync; triggers just once per 10 steps
                 ppl        = torch.exp(loss).item()
                 energy_val = avg_energy.item() if isinstance(avg_energy, torch.Tensor) else avg_energy
-                throughput = (B * T) / (time.time() - start_time)
+                elapsed_total = time.time() - start_time
+                try:
+                    grad_norm = sum(
+                        p.grad.norm().item() ** 2
+                        for p in model.parameters() if p.grad is not None
+                    ) ** 0.5
+                except Exception:
+                    grad_norm = 0.0
                 if wandb.run is not None:
                     wandb.log({
                         "train/loss": loss_val,
                         "train/ppl": ppl,
-                        "train/tokens_per_sec": throughput,
+                        "train/tokens_per_sec_total": (B * T) / max(elapsed_total, 1e-6),
+                        "train/tokens_per_sec_compute": (B * T) / max(t_compute, 1e-6),
                         "train/step": step,
                         "train/energy": energy_val,
                         "train/avg_iters": avg_iters,
+                        "train/grad_norm": grad_norm,
+                        "train/scaler_scale": scaler.get_scale(),
                     })
                 pbar.set_postfix({"loss": f"{loss_val:.4f}", "E": f"{energy_val:.3f}"})
+
+            # Reset timer AFTER logging/checkpoint work to exclude overhead from next-step measurement
+            start_time = time.time()
 
     print("\nTraining Complete.")
